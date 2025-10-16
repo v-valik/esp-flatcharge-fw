@@ -546,7 +546,7 @@ void BatteryManager::getChargingSetpoints(uint16_t& voltage, uint16_t& current, 
     // Adjust the per-PSU voltage around the measured value to track the desired current.
     // Once above the LV threshold, command the chemistry target directly.
     if (status.dataSource != BatterySource::CREE_LTO) {
-        const float LV_CC_THRESHOLD_V = 47.0f;
+        const float LV_CC_THRESHOLD_V = 49.0f;
         float measuredPerPsuV = 0.0f;
         if (psuCount > 0) measuredPerPsuV = status.packVoltage / static_cast<float>(psuCount);
 
@@ -580,9 +580,9 @@ void BatteryManager::getChargingSetpoints(uint16_t& voltage, uint16_t& current, 
             static unsigned long lvOcHoldUntilMs = 0; // cooldown to block step-ups after OC
             if (measuredI > (desiredI + OC_MARGIN_A)) {
                 float overshootA = measuredI - desiredI;
-                float dropV = 0.03f * overshootA; // 30 mV per amp overshoot
-                if (dropV < 0.08f) dropV = 0.08f; // minimum 80 mV drop
-                if (dropV > 0.15f) dropV = 0.15f; // cap at 150 mV drop
+                float dropV = 0.05f * overshootA; // 50 mV per amp overshoot
+                if (dropV < 0.10f) dropV = 0.10f; // minimum 100 mV drop
+                if (dropV > 0.30f) dropV = 0.30f; // cap at 300 mV drop
                 cmdV = measuredPerPsuV - dropV;
                 unsigned long holdMs = (overshootA > 1.5f) ? 2000UL : 1200UL; // shorter hold
                 lvOcHoldUntilMs = millis() + holdMs;
@@ -623,7 +623,7 @@ void BatteryManager::getChargingSetpoints(uint16_t& voltage, uint16_t& current, 
             // Absolute slew-rate limiting relative to last commanded setpoint to prevent large upward jumps
             if (lastPerPsuVoltageCmdV > 0.0f) {
                 const float MAX_STEP_UP_V = 0.01f;   // allow 10mV upward steps (matches centivolt resolution)
-                const float MAX_STEP_DOWN_V = 0.20f; // gentle shedding per update
+                const float MAX_STEP_DOWN_V = 0.30f; // faster shedding per update to respect current cap
                 float maxUp = lastPerPsuVoltageCmdV + MAX_STEP_UP_V;
                 float maxDown = lastPerPsuVoltageCmdV - MAX_STEP_DOWN_V;
                 if (cmdV > maxUp) cmdV = maxUp;

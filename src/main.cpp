@@ -952,6 +952,8 @@ void setup() {
             webServerManager.setMetricsSetCallback([](const String& body, String& message){
                 return metrics.setConfigFromJSON(body, message);
             });
+            // ADS1220 and Gree endpoints are only exposed for Gree Tractor builds
+            #if defined(BATTERY_PLATFORM_GREE_TRACTOR)
             // ADS1220 endpoints
             webServerManager.setAdsGetCallback([](float& currentA, bool& valid, float& zeroV, float& apv, float& rawV){
                 // Return the latest current even if "valid" is borderline; use a longer validity window
@@ -987,6 +989,7 @@ void setup() {
                 s += "}";
                 return s;
             });
+            #endif
             
             // Start Access Point mode
             if (webServerManager.startAccessPoint("FLATCHARGE", "flatcharge!")) {

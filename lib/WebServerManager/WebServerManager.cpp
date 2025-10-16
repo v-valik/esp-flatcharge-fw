@@ -529,6 +529,8 @@ void WebServerManager::setupAPIRoutes() {
     server->on("/api/battery", HTTP_GET, [this](AsyncWebServerRequest* request) {
         handleGetBattery(request);
     });
+    // Platform-specific endpoints (only for Gree Tractor builds)
+    #if defined(BATTERY_PLATFORM_GREE_TRACTOR)
     // ADS1220 status endpoint
     server->on("/api/ads1220", HTTP_GET, [this](AsyncWebServerRequest* request) {
         handleGetADS1220(request);
@@ -537,6 +539,7 @@ void WebServerManager::setupAPIRoutes() {
     server->on("/api/gree", HTTP_GET, [this](AsyncWebServerRequest* request) {
         handleGetGree(request);
     });
+    #endif
     // Metrics (InfluxDB) endpoints
     server->on("/api/metrics", HTTP_GET, [this](AsyncWebServerRequest* request) {
         handleGetMetrics(request);
@@ -620,6 +623,7 @@ void WebServerManager::setupAPIRoutes() {
         }
     );
 
+    #if defined(BATTERY_PLATFORM_GREE_TRACTOR)
     // ADS1220 calibration/config
     server->on("/api/ads1220", HTTP_POST,
         [](AsyncWebServerRequest* request) {},
@@ -655,6 +659,7 @@ void WebServerManager::setupAPIRoutes() {
             }
         }
     );
+    #endif
     
     // Set battery parameters (use body handler)
     server->on("/api/battery", HTTP_POST,
