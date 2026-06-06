@@ -882,7 +882,33 @@ void setup() {
             }
         }
     }
-    
+
+    // For the VX1 platform, re-assert Li-ion chemistry/ranges after loadSettings().
+    // Mirrors the Gree LTO guard above. Without this, NVS values left over from a
+    // prior Gree/LTO flashing on the same board (LTO chemistry, ~2.5V cell ceiling)
+    // leak into the VX1 build. That both shows the LTO slider range in the web UI
+    // (isLTO becomes true) and trips a FALSE over-voltage error: a non-LIION/NMC
+    // chemistry uses params.cellVoltageMax as the hard ceiling, so healthy ~3.6V
+    // cells read as "over max" (errorFlags |= 0x04). Gate it behind the build.
+    if (currentBatterySource == BATTERY_SOURCE_VECTRIX_VX1) {
+        BatteryParameters p = batteryManager.getParameters();
+        bool changed = false;
+        if (p.chemistry != VX1_BATTERY_CHEMISTRY) { p.chemistry = VX1_BATTERY_CHEMISTRY; changed = true; }
+        if (p.cellCount != userCellCount) { p.cellCount = userCellCount; changed = true; }
+        // Li-ion/NMC cell ceiling must stay within the safe window (3.80-4.16V/cell).
+        if (p.cellVoltageMax < 3800 || p.cellVoltageMax > 4160) { p.cellVoltageMax = 4050; changed = true; }
+        if (p.cellVoltageMin < 2500 || p.cellVoltageMin > 3200) { p.cellVoltageMin = 3000; changed = true; }
+        if (p.cellVoltageFloat == 0 || p.cellVoltageFloat >= p.cellVoltageMax) {
+            p.cellVoltageFloat = (p.cellVoltageMax > 50) ? (p.cellVoltageMax - 50) : p.cellVoltageMax;
+            changed = true;
+        }
+        if (changed) {
+            batteryManager.setParameters(p);
+            batteryManager.saveSettings();
+            Serial.println("[INIT] VX1: re-asserted Li-ion params (clamped stale NVS cell limits)");
+        }
+    }
+
     // Initialize VX1 manager if VX1 source is selected
     if (currentBatterySource == BATTERY_SOURCE_VECTRIX_VX1) {
         if (!vx1Manager.initialize(userCellCount)) {
