@@ -31,6 +31,7 @@ FlatpackManager::FlatpackManager() :
     for (int i = 0; i < MAX_CAN_BUSES; i++) {
         _psuDetectedOnBus[i] = false;
         _psuSerialOnBus[i] = 0;
+        _rejectedFrames[i] = 0;
     }
     
     // Create mutex for thread safety
@@ -65,26 +66,84 @@ FlatpackManager::~FlatpackManager() {
 void FlatpackManager::processCanMessage(const struct can_frame& msg, const char* canName) {
     // Convert CAN bus name to numeric ID for internal tracking
     uint8_t canBusId = canNameToId(canName);
-    
-    // Extract the CAN ID for debugging
+
+    // Per-frame trace is very noisy on a busy 125k bus and can stall the
+    // single-threaded loop long enough to miss a 5 s login refresh (which then
+    // makes the PSU log out and emit the very frames we must NOT mis-parse).
+    // Gate it behind a debug macro.
+#ifdef DEBUG_CAN_FRAMES
     Serial.printf("[FlatpackManager] Processing CAN message: ID=0x%08X, DLC=%d, Data[0]=0x%02X on %s\n",
                   msg.can_id, msg.can_dlc, msg.data[0], canName);
-    
-    // Process Status message FIRST
-    // Format: [intake temp][current LSB][current MSB][voltage LSB][voltage MSB]
-    //         [input V LSB][input V MSB][exhaust temp]
-    // Accept any 8-byte frame from Flatpack space (0x85xxxxxx) that is not a hello (data[0] != 0x1B)
-    if (msg.can_dlc == 8 && (msg.can_id & 0xFF000000) == 0x85000000 && msg.data[0] != 0x1B) {
+#endif
+
+    // We only handle Flatpack2 traffic, which uses 8-byte extended frames in
+    // the 0x05XXXXXX space. Mask off the CAN extended-frame flag (0x80000000)
+    // before inspecting the real 29-bit identifier.
+    if (msg.can_dlc != 8) {
+        return; // not a Flatpack frame; ignore quietly
+    }
+    const uint32_t rawId = msg.can_id & 0x1FFFFFFF;
+    if (((rawId >> 24) & 0xFF) != 0x05) {
+        return; // not in Flatpack ID space; ignore quietly (e.g. other CAN traffic)
+    }
+
+    const uint8_t b2 = (rawId >> 16) & 0xFF; // PSU id for addressed frames, 0x00 for hello
+    const uint8_t b1 = (rawId >> 8) & 0xFF;  // message-type byte (0x40 status, 0x44 login-req, 0xBF alert)
+    const uint8_t b0 = rawId & 0xFF;         // sub-type / status code
+
+    // Hello packet, 0x0500XXXX with 0x1B header (XXXX = last two serial bytes).
+    // Distinguished by PSU-id byte == 0x00 AND the 0x1B leading data byte so a
+    // status frame whose intake temp happens to be 0x1B (27 C) is not misread.
+    if (b2 == 0x00 && msg.data[0] == 0x1B) {
+        processHelloMessage(msg, canBusId);
+        return;
+    }
+
+    // Status, 0x05XX40YY, YY in {0x04,0x08,0x0C,0x10}. This is the ONLY frame
+    // type whose bytes 1..6 are output current/voltage/input voltage. Requiring
+    // both the 0x40 type byte and a valid status code rejects login-request
+    // (0x44) and alert (0xBF) frames that previously slipped through as status.
+    if (b1 == 0x40 &&
+        (b0 == STATUS_NORMAL || b0 == STATUS_CURRENT_LIMIT ||
+         b0 == STATUS_ALARM  || b0 == STATUS_WALK_IN)) {
         processStatusMessage(msg, canBusId);
         return;
     }
 
-    // Process CAN Hello packet - accept 0x85xxxxxx IDs with 0x1B header
-    // Observed hello IDs: 0x85000007, 0x85000425. Trailer byte varies; do not enforce.
-    if (msg.can_dlc == 8 && (msg.can_id & 0xFF000000) == 0x85000000 && msg.data[0] == 0x1B) {
-        processHelloMessage(msg, canBusId);
+    // Login-request / start-up notification, 0x05XX4400 (logged-out PSU). Must
+    // never be parsed as status.
+    if (b1 == 0x44 && b0 == 0x00) {
+        processLoginRequest(msg, canBusId);
         return;
     }
+
+    // Alert information, 0x05XXBFFC.
+    if (b1 == 0xBF && b0 == 0xFC) {
+        processAlertMessage(msg, canBusId);
+        return;
+    }
+
+    // Anything else in Flatpack ID space we could not classify: count it so the
+    // operator can see unexpected/garbage traffic via /api/status.
+    recordRejectedFrame(canBusId);
+}
+
+void FlatpackManager::recordRejectedFrame(uint8_t canBusId) {
+    if (canBusId < MAX_CAN_BUSES) {
+        _rejectedFrames[canBusId]++;
+    }
+}
+
+uint32_t FlatpackManager::getRejectedFrameCount(uint8_t canBusId) const {
+    if (canBusId == 0) {
+        uint32_t total = 0;
+        for (int i = 0; i < MAX_CAN_BUSES; i++) total += _rejectedFrames[i];
+        return total;
+    }
+    if (canBusId < MAX_CAN_BUSES) {
+        return _rejectedFrames[canBusId];
+    }
+    return 0;
 }
 
 /**
@@ -576,6 +635,22 @@ void FlatpackManager::processStatusMessage(const struct can_frame& msg, uint8_t 
     
     // Lock mutex for thread-safe access to flatpacks vector
     if (xSemaphoreTake(flatpacksMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        // Parse status data (little-endian). Validate BEFORE committing so a
+        // garbage frame cannot poison the pack aggregation.
+        uint16_t outputCurrent = (msg.data[2] << 8) | msg.data[1];
+        uint16_t outputVoltage = (msg.data[4] << 8) | msg.data[3];
+        uint16_t inputVoltage  = (msg.data[6] << 8) | msg.data[5];
+
+        if (outputVoltage > STATUS_VOLT_MAX_CV ||
+            outputCurrent > STATUS_CURR_MAX_DA ||
+            inputVoltage  > STATUS_VIN_MAX) {
+            // Implausible reading - almost certainly a mis-classified frame or
+            // bus noise. Drop it, keep the last good values, and count it.
+            recordRejectedFrame(canBusId);
+            xSemaphoreGive(flatpacksMutex);
+            return;
+        }
+
         // Look for PSUs on this CAN bus
         for (auto& fp : flatpacks) {
             // Match based on CAN bus ID - we only have one PSU per bus
@@ -584,14 +659,14 @@ void FlatpackManager::processStatusMessage(const struct can_frame& msg, uint8_t 
             fp.loggedIn = true;
             fp.lastStatusTime = millis();
             fp.status = statusCode;
-            
+
             // Parse status data
             fp.intakeTemp = msg.data[0];
             fp.exhaustTemp = msg.data[7];
-            fp.inputVoltage = (msg.data[6] << 8) | msg.data[5];
-            fp.outputCurrent = (msg.data[2] << 8) | msg.data[1];
-            fp.outputVoltage = (msg.data[4] << 8) | msg.data[3];
-            
+            fp.inputVoltage = inputVoltage;
+            fp.outputCurrent = outputCurrent;
+            fp.outputVoltage = outputVoltage;
+
             // Debug output for status updates
             #ifdef DEBUG_STATUS_MESSAGES
             Serial.printf("[FlatpackManager] Status update for PSU %s on CAN%d: %d.%02dV @ %d.%dA\n", 
@@ -619,6 +694,79 @@ void FlatpackManager::processStatusMessage(const struct can_frame& msg, uint8_t 
         #endif
     } else {
         Serial.println("[FlatpackManager] WARNING: Could not acquire mutex in processStatusMessage()");
+    }
+}
+
+/**
+ * @brief Handle a Flatpack login-request / start-up notification (0x05XX4400)
+ *
+ * A logged-out PSU emits this every ~10 s. Previously these 8-byte frames were
+ * mis-parsed as status (bytes 1..4 of the serial became "current"/"voltage"),
+ * which is the root cause of the 300 V / insane-amp readings. Here we treat it
+ * for what it is: the PSU needs to be (re)logged-in. Mark it logged out and
+ * proactively re-issue a login so it rejoins quickly.
+ */
+void FlatpackManager::processLoginRequest(const struct can_frame& msg, uint8_t canBusId) {
+    if (!flatpacksMutex) return;
+
+    // Payload bytes 0..5 are the PSU serial.
+    uint8_t serialBytes[6];
+    memcpy(serialBytes, &msg.data[0], 6);
+    uint64_t serial = bytesToSerial(serialBytes);
+
+    bool known = false;
+    if (xSemaphoreTake(flatpacksMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        for (auto& fp : flatpacks) {
+            if (fp.serial == serial || fp.canBusId == canBusId) {
+                fp.loggedIn = false; // it just told us it is logged out
+                known = (fp.serial == serial);
+                serial = fp.serial;  // prefer the registered serial for this bus
+                break;
+            }
+        }
+        xSemaphoreGive(flatpacksMutex);
+    }
+
+#ifdef DEBUG_CAN_FRAMES
+    Serial.printf("[FlatpackManager] Login-request from PSU on CAN%d (serial known=%d)\n",
+                  canBusId, known ? 1 : 0);
+#endif
+
+    // Re-login known PSUs immediately to minimise the logged-out window.
+    if (known) {
+        struct can_frame loginMsg;
+        sendLoginMessage(serial, loginMsg);
+    }
+}
+
+/**
+ * @brief Handle a Flatpack alert-information frame (0x05XXBFFC)
+ *
+ * Stores the reported warning/critical flag bytes against the PSU on this bus.
+ * Never parsed as status.
+ */
+void FlatpackManager::processAlertMessage(const struct can_frame& msg, uint8_t canBusId) {
+    if (!flatpacksMutex) return;
+
+    // Per protocol: data[0]=0x0E, data[1]=warn/crit, data[3]=flag1, data[4]=flag2
+    uint8_t flag1 = msg.data[3];
+    uint8_t flag2 = msg.data[4];
+
+    if (xSemaphoreTake(flatpacksMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        for (auto& fp : flatpacks) {
+            if (fp.canBusId == canBusId) {
+                fp.alertFlags[0] = flag1;
+                fp.alertFlags[1] = flag2;
+                fp.hasAlerts = (flag1 != 0 || flag2 != 0);
+                break;
+            }
+        }
+        xSemaphoreGive(flatpacksMutex);
+    }
+
+    if (flag1 != 0 || flag2 != 0) {
+        Serial.printf("[FlatpackManager] ALERT on CAN%d: flags=0x%02X 0x%02X (type=0x%02X)\n",
+                      canBusId, flag1, flag2, msg.data[1]);
     }
 }
 

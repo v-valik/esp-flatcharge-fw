@@ -151,6 +151,14 @@ public:
      */
     bool getAggregatedData(uint16_t& totalCurrent, uint16_t& avgVoltage, uint8_t& activePsuCount) const;
 
+    /**
+     * @brief Get the number of CAN frames rejected as invalid/out-of-range on a bus
+     *
+     * @param canBusId CAN bus id (1-3); pass 0 to get the sum across all buses
+     * @return Rejected-frame count
+     */
+    uint32_t getRejectedFrameCount(uint8_t canBusId = 0) const;
+
 private:
     std::vector<FlatpackData> flatpacks;
     FlatpackDetectionCallback detectionCallback;
@@ -164,6 +172,19 @@ private:
     static const uint8_t MAX_CAN_BUSES = 4; // 1 TWAI + 3 MCP2515
     bool _psuDetectedOnBus[MAX_CAN_BUSES];
     uint64_t _psuSerialOnBus[MAX_CAN_BUSES]; // Track which PSU serial is on each bus
+
+    // Diagnostics: count frames rejected because they were not valid Flatpack
+    // status frames or carried out-of-range values. Exposed for /api/status.
+    uint32_t _rejectedFrames[MAX_CAN_BUSES];
+
+    // Physical sanity limits for a single PSU's reported status values.
+    // Used to reject garbage parsed from non-status frames / bus noise before
+    // it can poison the pack aggregation. Generous bounds: the goal is to catch
+    // grossly wrong values (e.g. ~2900 A from a mis-parsed login frame), not to
+    // second-guess legitimate operation.
+    static constexpr uint16_t STATUS_VOLT_MAX_CV = 6000;   // 60.00 V per PSU
+    static constexpr uint16_t STATUS_CURR_MAX_DA = 1000;   // 100.0 A per PSU
+    static constexpr uint16_t STATUS_VIN_MAX = 30000;      // input AC raw cap
     
     // Constants for Flatpack2 protocol (match Flatpack2-main implementation)
     static constexpr uint32_t CAN_ID_HELLO = 0x05000000;
@@ -182,6 +203,9 @@ private:
     // Helper functions
     void processHelloMessage(const struct can_frame& msg, uint8_t canBusId);
     void processStatusMessage(const struct can_frame& msg, uint8_t canBusId);
+    void processLoginRequest(const struct can_frame& msg, uint8_t canBusId);
+    void processAlertMessage(const struct can_frame& msg, uint8_t canBusId);
+    void recordRejectedFrame(uint8_t canBusId);
     uint8_t canNameToId(const char* canName) const;
     void serialToString(uint64_t serial, char* buffer) const;
     uint64_t bytesToSerial(const uint8_t* bytes) const;

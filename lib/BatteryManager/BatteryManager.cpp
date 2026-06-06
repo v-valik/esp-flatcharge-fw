@@ -89,8 +89,9 @@ const BatteryParameters BatteryManager::defaultLIION = {
 };
 
 BatteryManager::BatteryManager() : 
-    capacityAh(0.0f), 
-    lastUpdateTime(0), 
+    capacityAh(0.0f),
+    lastUpdateTime(0),
+    chargingTimeMsRemainder(0),
     initialized(false),
     currentSource(BatterySource::MANUAL) {
     
@@ -263,10 +264,17 @@ const BatteryParameters& BatteryManager::getParameters() const {
 void BatteryManager::updateStatus(float voltage, float current, int8_t temperature) {
     unsigned long currentTime = millis();
     
-    // Calculate time elapsed since last update
+    // Calculate time elapsed since last update.
+    // The control loop runs every ~10-200 ms, so `elapsedMs / 60000` truncates
+    // to 0 on every call and the charge-time limit never advances. Accumulate
+    // milliseconds in a remainder and only roll whole minutes into the counter.
     if (lastUpdateTime > 0 && status.isCharging) {
         unsigned long elapsedMs = currentTime - lastUpdateTime;
-        status.chargingTimeMin += (elapsedMs / 60000); // Convert to minutes
+        chargingTimeMsRemainder += elapsedMs;
+        if (chargingTimeMsRemainder >= 60000UL) {
+            status.chargingTimeMin += (uint16_t)(chargingTimeMsRemainder / 60000UL);
+            chargingTimeMsRemainder %= 60000UL;
+        }
     }
     
     lastUpdateTime = currentTime;
@@ -328,6 +336,9 @@ bool BatteryManager::startCharging() {
     }
     
     status.isCharging = true;
+    status.chargingTimeMin = 0;
+    chargingTimeMsRemainder = 0;
+    lastUpdateTime = 0; // fresh baseline so the first delta isn't a huge gap
     updateChargingMode();
 
     // Reset and initialize current ramp
@@ -755,6 +766,7 @@ void BatteryManager::getChargingSetpoints(uint16_t& voltage, uint16_t& current, 
 
 void BatteryManager::resetChargingStats() {
     status.chargingTimeMin = 0;
+    chargingTimeMsRemainder = 0;
     status.isCharging = false;
     status.isError = false;
     status.errorFlags = 0;

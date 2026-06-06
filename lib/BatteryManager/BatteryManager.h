@@ -360,6 +360,7 @@ private:
     
     float capacityAh;             // Battery capacity in Ah
     unsigned long lastUpdateTime; // Last update time
+    unsigned long chargingTimeMsRemainder; // Sub-minute charge-time accumulator (ms)
     bool initialized;             // Whether battery is initialized
     BatterySource currentSource;  // Current battery data source
     

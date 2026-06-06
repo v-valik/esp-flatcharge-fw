@@ -109,13 +109,17 @@ void CANManager::processController(MCP2515& controller, const char* name, uint8_
     if (!digitalRead(intPin)) {
         struct can_frame msg;
         if (controller.readMessage(&msg) == MCP2515::ERROR_OK) {
-            // Print debug info
+            // Per-frame trace floods the serial port on a busy 125k bus and can
+            // stall the single-threaded loop long enough to miss PSU login
+            // refreshes. Gate behind a debug macro.
+#ifdef DEBUG_CAN_FRAMES
             Serial.printf("[%s] ID:0x%08lX DLC:%d Data:", name, msg.can_id, msg.can_dlc);
             for (uint8_t i = 0; i < msg.can_dlc; ++i) {
                 Serial.printf(" %02X", msg.data[i]);
             }
             Serial.println();
-            
+#endif
+
             // Call callback if set
             if (messageCallback) {
                 messageCallback(msg, name);
@@ -134,13 +138,15 @@ bool CANManager::sendMessage(int canId, const struct can_frame& msg) {
         default: return false;
     }
     
-    // Debug output to verify what's being sent
-    Serial.printf("[CANManager] Sending on CAN%d: ID=0x%08lX, Extended=%d, DLC=%d\n", 
-                 canId, 
-                 msg.can_id & CAN_EFF_MASK, 
+    // Debug output to verify what's being sent (gated to avoid serial flood)
+#ifdef DEBUG_CAN_FRAMES
+    Serial.printf("[CANManager] Sending on CAN%d: ID=0x%08lX, Extended=%d, DLC=%d\n",
+                 canId,
+                 msg.can_id & CAN_EFF_MASK,
                  (msg.can_id & CAN_EFF_FLAG) ? 1 : 0,
                  msg.can_dlc);
-    
+#endif
+
     // Send the message
     MCP2515::ERROR result = controller->sendMessage(&msg);
     

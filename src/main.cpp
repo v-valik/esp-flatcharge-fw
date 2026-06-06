@@ -586,7 +586,35 @@ void processTWAIMessages() {
 void updateChargingParameters() {
     // Get charging parameters from battery manager
     uint16_t voltage, current, ovp;
-    
+
+    // SAFETY: in VX1 mode the charge target is derived from the BMS FEF3 stream.
+    // If that stream goes stale (BMS node wedged, bus glitch, etc.) we must NOT
+    // keep pushing the last full CC/CV setpoint. Command all PSUs to a safe
+    // low-voltage / 0 A output and bail out until fresh data returns.
+    static constexpr uint32_t BMS_STALE_TIMEOUT_MS = 2000; // FEF3 arrives ~33/s
+    static bool sBmsStaleActive = false;
+    if (currentBatterySource == BATTERY_SOURCE_VECTRIX_VX1 &&
+        !vx1Manager.isDataValid(BMS_STALE_TIMEOUT_MS)) {
+        if (!sBmsStaleActive) {
+            Serial.println("[SAFE] VX1 BMS data stale (>2s). Forcing PSUs to 0 A safe output.");
+            sBmsStaleActive = true;
+        }
+        // Chemistry-safe OVP cap from configured per-cell maximum.
+        const BatteryParameters& bp = batteryManager.getParameters();
+        float packOvCapV = (bp.cellVoltageMax / 1000.0f) * bp.cellCount;
+        float ovpCapPerPsuV = packOvCapV / static_cast<float>(SERIES_PSU_COUNT);
+        float ovpPerPsuV = FLATPACK_VOLT_MIN + 1.0f;
+        if (ovpPerPsuV > ovpCapPerPsuV) ovpPerPsuV = ovpCapPerPsuV;
+        uint16_t vCv = static_cast<uint16_t>(FLATPACK_VOLT_MIN * 100.0f);
+        uint16_t i_dA = 0; // 0.0 A disables output
+        uint16_t ovpCv = static_cast<uint16_t>(ovpPerPsuV * 100.0f);
+        flatpackManager.setOutputParameters(vCv, i_dA, ovpCv, 0);
+        return;
+    } else if (sBmsStaleActive) {
+        Serial.println("[INFO] VX1 BMS data fresh again. Resuming normal charging updates.");
+        sBmsStaleActive = false;
+    }
+
     // Evaluate runtime stack health (count online vs expected)
     const auto& fps = flatpackManager.getFlatpacks();
     uint8_t online = 0; for (const auto& p : fps) { if (p.loggedIn) ++online; }
@@ -629,9 +657,13 @@ void updateChargingParameters() {
         Serial.printf("[WARN] Detected %u PSUs in registry, but using configured %u.\n", detectedCount, SERIES_PSU_COUNT);
     }
     batteryManager.getChargingSetpoints(voltage, current, ovp, SERIES_PSU_COUNT);
-    
-    // Only update if we have valid setpoints
-    if (voltage > 0 && current > 0 && ovp > 0) {
+
+    // A current of 0 is a VALID command ("output off") that several safety
+    // paths in getChargingSetpoints() deliberately return (deep-LV duty OFF
+    // phase, precharge lockout). Previously the `current > 0` guard silently
+    // dropped those, leaving the last non-zero current active. Only voltage and
+    // OVP must be non-zero for the frame to be well-formed.
+    if (voltage > 0 && ovp > 0) {
         struct can_frame setpointMsg;
         if (flatpackManager.setOutputParameters(voltage, current, ovp, 0)) { // 0 = all PSUs
             // Parameters are sent via the canSendCallback
