@@ -525,7 +525,7 @@ void WebServerManager::setupAPIRoutes() {
         if (topologyGetCallback) {
             request->send(200, "application/json", topologyGetCallback());
         } else {
-            request->send(503, "application/json", "{\\"error\\":\\"Unavailable\\"}");
+            request->send(503, "application/json", R"({"error":"Unavailable"})");
         }
     });
     server->on("/api/topology", HTTP_POST,
@@ -544,7 +544,7 @@ void WebServerManager::setupAPIRoutes() {
             delete body;
             req->_tempObject = nullptr;
             if (err || !doc["mode"].is<const char*>() || !doc["count"].is<int>()) {
-                req->send(400, "application/json", "{\\"error\\":\\"Invalid topology payload\\"}");
+                req->send(400, "application/json", R"({"error":"Invalid topology payload"})");
                 return;
             }
             const String mode = doc["mode"].as<String>();
@@ -552,11 +552,11 @@ void WebServerManager::setupAPIRoutes() {
             if ((mode != "series" && mode != "parallel") || count < 1 || count > 3 ||
                 !topologySetCallback ||
                 !topologySetCallback(mode == "parallel", static_cast<uint8_t>(count))) {
-                req->send(400, "application/json", "{\\"error\\":\\"Topology rejected\\"}");
+                req->send(400, "application/json", R"({"error":"Topology rejected"})");
                 return;
             }
             req->send(200, "application/json",
-                "{\\"success\\":true,\\"message\\":\\"Saved; restart required\\"}");
+                R"({"success":true,"message":"Saved; restart required"})");
         });
     
     // Flatpack data endpoint
