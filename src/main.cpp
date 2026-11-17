@@ -11,6 +11,8 @@
 #include "ADS1220Manager.h"
 #include "MetricsManager.h"
 #include "charging_profiles.h"
+#include "PylontechBms.h"
+#include "PsuTopology.h"
 #include <driver/twai.h>
 
 // Build-time configuration (e.g., series PSU count)
@@ -34,6 +36,7 @@
 #define BATTERY_SOURCE_MANUAL 0        // Manual configuration/preset values
 #define BATTERY_SOURCE_CREE_LTO 1      // Cree LTO battery with CAN communication  
 #define BATTERY_SOURCE_VECTRIX_VX1 2   // Vectrix VX1 BMS via CAN (FEF3 messages)
+#define BATTERY_SOURCE_PYLONTECH_CAN 3
 
 // Default configuration - can be changed via serial commands or web interface
 #define DEFAULT_BATTERY_SOURCE BATTERY_SOURCE_MANUAL
@@ -76,14 +79,20 @@ VectrixVX1Manager vx1Manager;
 GreeLTOManager greeManager;
 ADS1220Manager ads1220;
 MetricsManager metrics;
+PsuTopology psuTopology;
+PylontechBms pylonBms;
 
 // Mismatch guard: if detected series PSUs != configured, we hold normal updates
 static bool gPsuMismatchActive = false;
 
 // TWAI configuration (default 250 kbps; define TWAI_GREE_500K to use 500 kbps)
 // Per pins.md: RX=GPIO5, TX=GPIO6. Macro expects (TX, RX) order.
+#if defined(BATTERY_PLATFORM_PYLONTECH)
+twai_general_config_t twai_g_config = TWAI_GENERAL_CONFIG_DEFAULT(GPIO_NUM_6, GPIO_NUM_5, TWAI_MODE_LISTEN_ONLY);
+#else
 twai_general_config_t twai_g_config = TWAI_GENERAL_CONFIG_DEFAULT(GPIO_NUM_6, GPIO_NUM_5, TWAI_MODE_NORMAL);
-#ifdef TWAI_GREE_500K
+#endif
+#if defined(BATTERY_PLATFORM_PYLONTECH) || defined(TWAI_GREE_500K)
 twai_timing_config_t twai_t_config = TWAI_TIMING_CONFIG_500KBITS();
 #else
 twai_timing_config_t twai_t_config = TWAI_TIMING_CONFIG_250KBITS();
@@ -93,7 +102,9 @@ twai_timing_config_t twai_t_config = TWAI_TIMING_CONFIG_250KBITS();
 twai_filter_config_t twai_f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
 
 // Current battery source configuration (compile-time selection)
-#if defined(BATTERY_PLATFORM_VX1)
+#if defined(BATTERY_PLATFORM_PYLONTECH)
+int currentBatterySource = BATTERY_SOURCE_PYLONTECH_CAN;
+#elif defined(BATTERY_PLATFORM_VX1)
 int currentBatterySource = BATTERY_SOURCE_VECTRIX_VX1;
 #elif defined(BATTERY_PLATFORM_GREE_TRACTOR)
 int currentBatterySource = BATTERY_SOURCE_CREE_LTO;
@@ -504,6 +515,15 @@ void processTWAIMessages() {
         }
 #endif
 
+        // Solar BMS uses standard 11-bit frames; consume them before the
+        // legacy extended-ID filter for VX1/Gree.
+#if defined(BATTERY_PLATFORM_PYLONTECH)
+        if (!isExtended && !(message.flags & TWAI_MSG_FLAG_RTR)) {
+            pylonBms.ingest(message.identifier, false, false, message.data,
+                             message.data_length_code, millis());
+        }
+        continue;
+#endif
         // For normal processing below we only pass extended frames to managers
         if (!isExtended) {
             continue;
@@ -751,10 +771,26 @@ void setup() {
     }
     Serial.println("[INIT] Hardware manager initialized successfully");
     
-    // Initialize TWAI for selected platform (both VX1 and Gree use 250kbps)
+    // Topology defaults stay unchanged for legacy builds; Pylontech defaults
+    // to a single PSU in parallel mode. Saved UI settings take effect on boot.
+#if defined(BATTERY_PLATFORM_PYLONTECH)
+    psuTopology.load(PsuTopology::Mode::PARALLEL, 1);
+#else
+    psuTopology.load(PsuTopology::Mode::SERIES, SERIES_PSU_COUNT);
+#endif
+    Serial.printf("[PSU] Topology %s x%u\n", psuTopology.name(), psuTopology.count());
+
+    // Initialize TWAI for selected platform
     if (currentBatterySource == BATTERY_SOURCE_VECTRIX_VX1 ||
-        currentBatterySource == BATTERY_SOURCE_CREE_LTO) {
-        Serial.println("[INIT] Configuring TWAI (250kbps)");
+        currentBatterySource == BATTERY_SOURCE_CREE_LTO ||
+        currentBatterySource == BATTERY_SOURCE_PYLONTECH_CAN) {
+        Serial.println(currentBatterySource == BATTERY_SOURCE_PYLONTECH_CAN
+            ? "[INIT] Pylontech CAN 500kbps Listen-Only"
+            : "[INIT] Configuring TWAI (250kbps)");
+#if defined(BATTERY_PLATFORM_PYLONTECH)
+        twai_g_config.rx_queue_len = 64;
+        twai_g_config.tx_queue_len = 0;
+#endif
 
 #ifdef TWAI_GREE_TRAFFIC_DEBUG
         // In debug, force listen-only and larger queues to sniff without ACK
@@ -827,6 +863,13 @@ void setup() {
             Serial.printf("[INIT] Configuring for Vectrix VX1 BMS (%dS, %.2fV target)\n", 
                          userCellCount, userTargetCellVoltage);
             break;
+        case BATTERY_SOURCE_PYLONTECH_CAN:
+            chemistry = BatteryChemistry::LFP;
+            cellCount = 16;
+            capacity = 314.0f;
+            source = BatterySource::PYLONTECH_CAN;
+            Serial.println("[INIT] Pylontech 16S LFP, 314Ah, BMS-controlled");
+            break;
         case BATTERY_SOURCE_CREE_LTO:
             chemistry = BatteryChemistry::LTO;
             cellCount = 36;  // Gree LTO pack (36S)
@@ -856,6 +899,20 @@ void setup() {
     
     // Load saved settings after initialization so they override defaults
     batteryManager.loadSettings();
+
+    if (currentBatterySource == BATTERY_SOURCE_PYLONTECH_CAN) {
+        batteryManager.setOperatingMode(OperatingMode::BMS_CONTROLLED);
+        batteryManager.setDisableCurrentLimit(false);
+        BatteryParameters p = batteryManager.getParameters();
+        p.chemistry = BatteryChemistry::LFP;
+        p.cellCount = 16;
+        // Keep original float profile, cap CV at 56.32 V.
+        if (p.cellVoltageMax > 3520 || p.cellVoltageMax < 3200)
+            p.cellVoltageMax = 3520;
+        if (p.cellVoltageFloat > p.cellVoltageMax)
+            p.cellVoltageFloat = p.cellVoltageMax;
+        batteryManager.setParameters(p);
+    }
 
     // For Gree LTO platform, prefer BMS-controlled mode by default
     // NVS may have preserved MANUAL from previous runs; override here to follow Gree BMS
@@ -1075,7 +1132,11 @@ void setup() {
     }
     
     // Handle battery charging and voltage sweep based on configuration flags
-    if (ENABLE_BATTERY_CHARGING) {
+    if (currentBatterySource == BATTERY_SOURCE_PYLONTECH_CAN) {
+        chargingEnabled = true; // controller active; no charge until BMS permits
+        batteryManager.stopCharging();
+        Serial.println("[INIT] Pylontech waiting for 0x351/355/356/359/35C");
+    } else if (ENABLE_BATTERY_CHARGING) {
         chargingEnabled = true;
         batteryManager.startCharging();
         Serial.println("[INIT] Battery charging enabled");
@@ -1112,6 +1173,13 @@ void loop() {
     
     // Update managers
     flatpackManager.update();
+#if defined(BATTERY_PLATFORM_PYLONTECH)
+    if (pylonBms.valid(millis())) {
+        batteryManager.updateFromPylontech(pylonBms.data(), pylonBms.canCharge(millis()));
+    } else {
+        batteryManager.invalidatePylontech();
+    }
+#endif
     batteryManager.update();
     ads1220.update();
     metrics.update();
