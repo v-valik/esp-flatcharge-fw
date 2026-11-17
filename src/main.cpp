@@ -81,6 +81,7 @@ ADS1220Manager ads1220;
 MetricsManager metrics;
 PsuTopology psuTopology;
 PylontechBms pylonBms;
+bool gPylontechManualInhibit = false; // Optional operator stop, resets on generator start
 
 // Mismatch guard: if detected series PSUs != configured, we hold normal updates
 static bool gPsuMismatchActive = false;
@@ -329,7 +330,15 @@ bool setDefaultPerPsuVoltageCb(float volts) {
 }
 
 bool setChargingEnabled(bool enabled) {
-    if (currentBatterySource == BATTERY_SOURCE_PYLONTECH_CAN) return false;
+    if (currentBatterySource == BATTERY_SOURCE_PYLONTECH_CAN) {
+        // Manual operator stop/resume cannot bypass BMS gating.
+        gPylontechManualInhibit = !enabled;
+        if (!enabled) {
+            batteryManager.stopCharging();
+            flatpackManager.setOutputParameters(4370, 0, 4500, 0);
+        }
+        return true;
+    }
     Serial.printf("[Main] %s charging\n", enabled ? "Starting" : "Stopping");
     if (enabled) {
         // Start charging sequence to initialize ramp and mode
@@ -629,8 +638,8 @@ void updateChargingParameters() {
         // 16S LFP cannot be charged by two or more 43.5V-minimum rectifiers
         // in series. A mismatched topology is a start-inhibit condition.
         const bool compatible = psuTopology.seriesCount() == 1;
-        if (!valid || !compatible) {
-            batteryManager.stopCharging();
+        if (!valid || !compatible || gPylontechManualInhibit) {
+            if (batteryManager.getStatus().isCharging) batteryManager.stopCharging();
             flatpackManager.setOutputParameters(4370, 0, 4500, 0);
             return;
         }
@@ -642,7 +651,7 @@ void updateChargingParameters() {
                 ++readyCount;
         }
         if (readyCount != psuTopology.count()) {
-            batteryManager.stopCharging();
+            if (batteryManager.getStatus().isCharging) batteryManager.stopCharging();
             flatpackManager.setOutputParameters(4370, 0, 4500, 0);
             return;
         }
