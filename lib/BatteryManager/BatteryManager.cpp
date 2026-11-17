@@ -1034,7 +1034,11 @@ void BatteryManager::updateChargingMode() {
     // Get charging current as C-rate (proportion of capacity)
     float cRate = 0.0f;
     if (capacityAh > 0) {
-        cRate = (status.packCurrent / capacityAh) * 100.0f; // in percent of capacity
+        // Pylontech current polarity depends on BMS profile; CV taper
+        // detection must use magnitude, not interpret negative current as 0.
+        const float measuredA = status.dataSource == BatterySource::PYLONTECH_CAN
+            ? fabsf(status.packCurrent) : status.packCurrent;
+        cRate = (measuredA / capacityAh) * 100.0f; // percent of capacity
     }
     
     ChargingMode previousMode = status.mode;
