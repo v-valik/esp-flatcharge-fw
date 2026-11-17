@@ -10,11 +10,12 @@ class PsuTopology {
 public:
     enum class Mode : uint8_t { SERIES = 0, PARALLEL = 1 };
 
-    void load(Mode defaultMode, uint8_t defaultCount) {
+    void load(Mode defaultMode, uint8_t defaultCount, const char* storageNamespace) {
+        namespace_ = storageNamespace;
         mode_ = defaultMode;
         count_ = validCount(defaultCount) ? defaultCount : 1;
         Preferences prefs;
-        if (prefs.begin("psu-topology", true)) {
+        if (prefs.begin(namespace_, true)) {
             uint8_t m = prefs.getUChar("mode", static_cast<uint8_t>(mode_));
             uint8_t n = prefs.getUChar("count", count_);
             if (m <= 1 && validCount(n)) {
@@ -29,7 +30,7 @@ public:
         if (static_cast<uint8_t>(mode) > 1 || !validCount(count))
             return false;
         Preferences prefs;
-        if (!prefs.begin("psu-topology", false)) return false;
+        if (!prefs.begin(namespace_, false)) return false;
         bool ok = prefs.putUChar("mode", static_cast<uint8_t>(mode)) == 1;
         ok = prefs.putUChar("count", count) == 1 && ok;
         prefs.end();
@@ -45,6 +46,7 @@ public:
 
 private:
     static bool validCount(uint8_t count) { return count >= 1 && count <= 3; }
+    const char* namespace_ = "psu-topology";
     Mode mode_ = Mode::SERIES;
     uint8_t count_ = 1;
 };
