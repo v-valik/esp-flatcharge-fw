@@ -634,6 +634,24 @@ void updateChargingParameters() {
     // Get charging parameters from battery manager
     uint16_t voltage, current, ovp;
 
+    // Shared physical constraint: the chosen wiring must place every
+    // rectifier within the achievable 43.5..57.5V range. Incompatible
+    // configurations must never silently reuse the previous high setpoint.
+    const BatteryParameters& topologyBattery = batteryManager.getParameters();
+    const float nominalPackTargetV =
+        (topologyBattery.cellVoltageMax / 1000.0f) * topologyBattery.cellCount;
+    const float perPsuTargetV = nominalPackTargetV / psuTopology.seriesCount();
+    if (perPsuTargetV < FLATPACK_VOLT_MIN || perPsuTargetV > FLATPACK_VOLT_MAX) {
+        static uint32_t lastBadTopologyLog = 0;
+        if ((uint32_t)(millis() - lastBadTopologyLog) > 5000) {
+            lastBadTopologyLog = millis();
+            Serial.printf("[SAFE] Wiring %s x%u incompatible with %.2fV battery target; output OFF\n",
+                          psuTopology.name(), psuTopology.count(), nominalPackTargetV);
+        }
+        flatpackManager.setOutputParameters(4370, 0, 4500, 0);
+        return;
+    }
+
     if (currentBatterySource == BATTERY_SOURCE_PYLONTECH_CAN) {
         const bool valid = pylonBms.canCharge(millis());
         // 16S LFP cannot be charged by two or more 43.5V-minimum rectifiers
