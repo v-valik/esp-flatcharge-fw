@@ -674,6 +674,7 @@
 
     <script>
         let updateInterval;
+        let lastTopology = null;
         let isConnected = false;
         let userEditing = { current: false, maxVoltage: false, calOffset: false, defaultPsu: false, mode: false, disableCL: false, acPreset: false, topology: false };
         let refreshHoldUntil = 0;
@@ -1017,8 +1018,18 @@
                 </div>
             `;
 
+            // Pylontech LV reports pack metrics, not per-cell min/max in this frame set.
+            if (battery.dataSource === "pylontech") {
+                const valid = !!battery.bmsDataValid;
+                const allowed = valid && !!battery.bmsChargeAllowed;
+                html += `<div class="info-card"><div class="info-value">${valid ? "ONLINE" : "STALE"}</div><div class="info-label">Pylontech BMS</div></div>`;
+                html += `<div class="info-card"><div class="info-value">${allowed ? "YES" : "NO"}</div><div class="info-label">BMS Charge Permission</div></div>`;
+                html += `<div class="info-card"><div class="info-value">${valid ? battery.bmsChargeVoltageLimitV.toFixed(2)+"V" : "--"}</div><div class="info-label">BMS CVL</div></div>`;
+                html += `<div class="info-card"><div class="info-value">${valid ? battery.bmsChargeCurrentLimitA.toFixed(1)+"A" : "--"}</div><div class="info-label">BMS CCL</div></div>`;
+            }
+
             // If VX1 data is present (or fields provided), append high/low cells, delta, and min/max temps
-            const hasVX1 = (battery.dataSource === 'vx1') || (typeof battery.cellVoltageMax === 'number' && typeof battery.cellVoltageMin === 'number');
+            const hasVX1 = battery.dataSource === 'vx1' || battery.dataSource === 'cree_lto';
             if (hasVX1) {
                 const vMax = (typeof battery.cellVoltageMax === 'number' && !isNaN(battery.cellVoltageMax)) ? `${battery.cellVoltageMax.toFixed(3)}V` : 'N/A';
                 const vMin = (typeof battery.cellVoltageMin === 'number' && !isNaN(battery.cellVoltageMin)) ? `${battery.cellVoltageMin.toFixed(3)}V` : 'N/A';
@@ -1115,6 +1126,7 @@
             updatePSUDisplay(fps);
             if (battery) { lastBattery = battery; updateBatteryDisplay(battery); }
             if (system) updateSystemInfo(system);
+            if (topology) lastTopology = topology;
             if (topology && !userEditing.topology) {
                 document.getElementById("psuTopologyMode").value = topology.mode;
                 document.getElementById("psuTopologyCount").value = String(topology.count);
@@ -1151,7 +1163,7 @@
 
             const fps = lastFps || [];
             const online = fps.filter(p => p && p.loggedIn);
-            const psuCount = online.length || 3;
+            const psuCount = online.length || (lastTopology ? lastTopology.count : 3);
 
             // Average measured VAC and per‑PSU DC voltage
             const vacAvg = (online.length > 0)
@@ -1160,7 +1172,7 @@
 
             let vpsu = 48.0;
             if (lastBattery && typeof lastBattery.packVoltage === 'number' && psuCount > 0) {
-                vpsu = clamp(lastBattery.packVoltage / psuCount, 43.5, 57.5);
+                vpsu = clamp(lastBattery.packVoltage / (lastTopology ? lastTopology.seriesCount : psuCount), 43.5, 57.5);
             } else if (online.length > 0) {
                 vpsu = clamp(online.reduce((acc, p) => acc + ((p.outputVoltage || 0) / 100.0), 0) / online.length, 43.5, 57.5);
             }
