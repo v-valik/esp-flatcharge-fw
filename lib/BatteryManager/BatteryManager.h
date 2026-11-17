@@ -4,6 +4,7 @@
 #include <vector>
 #include <functional>
 #include <Preferences.h>
+#include "PylontechBms.h"
 
 // Forward declarations
 struct VX1BmsData;
@@ -24,7 +25,8 @@ enum class BatteryChemistry {
 enum class BatterySource {
     MANUAL,     // Manual configuration
     CREE_LTO,   // Cree LTO battery with CAN communication
-    VECTRIX_VX1 // Vectrix VX1 BMS via CAN (FEF3 messages)
+    VECTRIX_VX1, // Vectrix VX1 BMS via CAN (FEF3 messages)
+    PYLONTECH_CAN // Pylontech low-voltage CAN (passive)
 };
 
 /**
@@ -107,6 +109,9 @@ struct BatteryStatus {
     uint32_t errorFlags;          // Error condition flags
     BatterySource dataSource;     // Current data source
     bool bmsDataValid;            // Whether BMS data is valid and recent
+    float bmsChargeVoltageLimitV = 0.0f;
+    float bmsChargeCurrentLimitA = 0.0f;
+    bool bmsChargeAllowed = false;
     OperatingMode operatingMode;  // Manual or BMS controlled
     float manualCurrentLimit;     // Manual current limit (A) when in manual mode
     float voltageDropCompensation; // Voltage drop compensation (V)
@@ -208,6 +213,11 @@ public:
      * @param psuCount Number of PSUs in series (voltage will be divided by this)
      */
     void getChargingSetpoints(uint16_t& voltage, uint16_t& current, uint16_t& ovp, uint8_t psuCount);
+    // seriesCount divides voltage; parallelCount divides total current.
+    void getChargingSetpoints(uint16_t& voltage, uint16_t& current, uint16_t& ovp,
+                              uint8_t seriesCount, uint8_t parallelCount);
+    void updateFromPylontech(const PylontechBms::Data& data, bool allowed);
+    void invalidatePylontech();
     
     /**
      * @brief Reset charging statistics and timers
