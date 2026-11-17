@@ -1163,7 +1163,7 @@
 
             const fps = lastFps || [];
             const online = fps.filter(p => p && p.loggedIn);
-            const psuCount = online.length || (lastTopology ? lastTopology.count : 3);
+            const psuCount = (lastTopology && lastTopology.count) ? lastTopology.count : 3;
 
             // Average measured VAC and per‑PSU DC voltage
             const vacAvg = (online.length > 0)
