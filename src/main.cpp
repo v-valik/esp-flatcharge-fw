@@ -154,7 +154,9 @@ bool setAcPresetCb(uint8_t presetId) {
     std::vector<FlatpackData> online;
     online.reserve(fps.size());
     for (const auto& p : fps) if (p.loggedIn) online.push_back(p);
-    const uint8_t psuCount = online.empty() ? psuTopology.count() : static_cast<uint8_t>(online.size());
+    // Generator AC budget is shared by the CONFIGURED number of PSUs.
+    // Counting only online devices could overallocate after a restart.
+    const uint8_t psuCount = psuTopology.count();
 
     // Average VAC across online PSUs
     float vacAvg = 230.0f;
