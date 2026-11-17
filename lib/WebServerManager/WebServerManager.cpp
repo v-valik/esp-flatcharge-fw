@@ -1770,7 +1770,12 @@ String WebServerManager::generateBatteryJSON() const {
             case BatterySource::MANUAL: doc["dataSource"] = "manual"; break;
             case BatterySource::CREE_LTO: doc["dataSource"] = "cree_lto"; break;
             case BatterySource::VECTRIX_VX1: doc["dataSource"] = "vx1"; break;
+            case BatterySource::PYLONTECH_CAN: doc["dataSource"] = "pylontech"; break;
         }
+        doc["bmsDataValid"] = status.bmsDataValid;
+        doc["bmsChargeAllowed"] = status.bmsChargeAllowed;
+        doc["bmsChargeVoltageLimitV"] = status.bmsChargeVoltageLimitV;
+        doc["bmsChargeCurrentLimitA"] = status.bmsChargeCurrentLimitA;
         doc["manualCurrentLimit"] = status.manualCurrentLimit;
         doc["voltageDropCompensation"] = status.voltageDropCompensation;
         doc["disableCurrentLimit"] = status.disableCurrentLimit;
