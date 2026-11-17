@@ -11,6 +11,8 @@
 #include "ADS1220Manager.h"
 #include "MetricsManager.h"
 #include "charging_profiles.h"
+#include "PylontechBms.h"
+#include "PsuTopology.h"
 #include <driver/twai.h>
 
 // Build-time configuration (e.g., series PSU count)
@@ -34,6 +36,7 @@
 #define BATTERY_SOURCE_MANUAL 0        // Manual configuration/preset values
 #define BATTERY_SOURCE_CREE_LTO 1      // Cree LTO battery with CAN communication  
 #define BATTERY_SOURCE_VECTRIX_VX1 2   // Vectrix VX1 BMS via CAN (FEF3 messages)
+#define BATTERY_SOURCE_PYLONTECH_CAN 3
 
 // Default configuration - can be changed via serial commands or web interface
 #define DEFAULT_BATTERY_SOURCE BATTERY_SOURCE_MANUAL
@@ -76,14 +79,21 @@ VectrixVX1Manager vx1Manager;
 GreeLTOManager greeManager;
 ADS1220Manager ads1220;
 MetricsManager metrics;
+PsuTopology psuTopology;
+PylontechBms pylonBms;
+bool gPylontechManualInhibit = false; // Optional operator stop, resets on generator start
 
 // Mismatch guard: if detected series PSUs != configured, we hold normal updates
 static bool gPsuMismatchActive = false;
 
 // TWAI configuration (default 250 kbps; define TWAI_GREE_500K to use 500 kbps)
 // Per pins.md: RX=GPIO5, TX=GPIO6. Macro expects (TX, RX) order.
+#if defined(BATTERY_PLATFORM_PYLONTECH)
+twai_general_config_t twai_g_config = TWAI_GENERAL_CONFIG_DEFAULT(GPIO_NUM_6, GPIO_NUM_5, TWAI_MODE_LISTEN_ONLY);
+#else
 twai_general_config_t twai_g_config = TWAI_GENERAL_CONFIG_DEFAULT(GPIO_NUM_6, GPIO_NUM_5, TWAI_MODE_NORMAL);
-#ifdef TWAI_GREE_500K
+#endif
+#if defined(BATTERY_PLATFORM_PYLONTECH) || defined(TWAI_GREE_500K)
 twai_timing_config_t twai_t_config = TWAI_TIMING_CONFIG_500KBITS();
 #else
 twai_timing_config_t twai_t_config = TWAI_TIMING_CONFIG_250KBITS();
@@ -93,7 +103,9 @@ twai_timing_config_t twai_t_config = TWAI_TIMING_CONFIG_250KBITS();
 twai_filter_config_t twai_f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
 
 // Current battery source configuration (compile-time selection)
-#if defined(BATTERY_PLATFORM_VX1)
+#if defined(BATTERY_PLATFORM_PYLONTECH)
+int currentBatterySource = BATTERY_SOURCE_PYLONTECH_CAN;
+#elif defined(BATTERY_PLATFORM_VX1)
 int currentBatterySource = BATTERY_SOURCE_VECTRIX_VX1;
 #elif defined(BATTERY_PLATFORM_GREE_TRACTOR)
 int currentBatterySource = BATTERY_SOURCE_CREE_LTO;
@@ -142,7 +154,9 @@ bool setAcPresetCb(uint8_t presetId) {
     std::vector<FlatpackData> online;
     online.reserve(fps.size());
     for (const auto& p : fps) if (p.loggedIn) online.push_back(p);
-    const uint8_t psuCount = online.empty() ? SERIES_PSU_COUNT : static_cast<uint8_t>(online.size());
+    // Generator AC budget is shared by the CONFIGURED number of PSUs.
+    // Counting only online devices could overallocate after a restart.
+    const uint8_t psuCount = psuTopology.count();
 
     // Average VAC across online PSUs
     float vacAvg = 230.0f;
@@ -155,7 +169,7 @@ bool setAcPresetCb(uint8_t presetId) {
     float vpsu = 48.0f;
     const BatteryStatus& bs = batteryManager.getStatus();
     if (bs.packVoltage > 1.0f && psuCount > 0) {
-        vpsu = bs.packVoltage / static_cast<float>(psuCount);
+        vpsu = bs.packVoltage / static_cast<float>(psuTopology.seriesCount());
     } else if (!online.empty()) {
         float sumV = 0.0f; for (const auto& p : online) sumV += (p.outputVoltage / 100.0f); // cV -> V
         vpsu = sumV / online.size();
@@ -253,6 +267,7 @@ const BatteryParameters& getBatteryParameters() {
 }
 
 bool setChargingParameters(uint16_t voltage, uint16_t current, uint16_t ovp) {
+    if (currentBatterySource == BATTERY_SOURCE_PYLONTECH_CAN) return false;
     return flatpackManager.setOutputParameters(voltage, current, ovp);
 }
 
@@ -262,6 +277,7 @@ bool setBatteryParameters(const BatteryParameters& params) {
 }
 
 bool setOperatingMode(OperatingMode mode) {
+    if (currentBatterySource == BATTERY_SOURCE_PYLONTECH_CAN && mode != OperatingMode::BMS_CONTROLLED) return false;
     batteryManager.setOperatingMode(mode);
     batteryManager.saveSettings();
     return true;
@@ -290,6 +306,7 @@ bool setVoltageCalibrationOffsetCb(float offsetV) {
 
 // Disable current limiting (dangerous). When enabled, firmware will bypass soft-start and current clamps.
 bool setDisableCurrentLimitCb(bool disabled) {
+    if (currentBatterySource == BATTERY_SOURCE_PYLONTECH_CAN && disabled) return false;
     Serial.printf("[Main] Disable current limit: %s\n", disabled ? "ON" : "OFF");
     bool result = batteryManager.setDisableCurrentLimit(disabled);
     if (result) batteryManager.saveSettings();
@@ -298,6 +315,7 @@ bool setDisableCurrentLimitCb(bool disabled) {
 
 // Set default per-PSU voltage used as NVRAM fallback inside each rectifier
 bool setDefaultPerPsuVoltageCb(float volts) {
+    if (currentBatterySource == BATTERY_SOURCE_PYLONTECH_CAN && fabsf(volts - 43.7f) > 0.01f) return false;
     Serial.printf("[Main] Setting default per-PSU fallback voltage to %.2fV\n", volts);
     bool result = batteryManager.setDefaultPerPsuVoltage(volts);
     if (result) {
@@ -315,6 +333,15 @@ bool setDefaultPerPsuVoltageCb(float volts) {
 }
 
 bool setChargingEnabled(bool enabled) {
+    if (currentBatterySource == BATTERY_SOURCE_PYLONTECH_CAN) {
+        // Manual operator stop/resume cannot bypass BMS gating.
+        gPylontechManualInhibit = !enabled;
+        if (!enabled) {
+            batteryManager.stopCharging();
+            flatpackManager.setOutputParameters(4370, 0, 4500, 0);
+        }
+        return true;
+    }
     Serial.printf("[Main] %s charging\n", enabled ? "Starting" : "Stopping");
     if (enabled) {
         // Start charging sequence to initialize ramp and mode
@@ -335,7 +362,7 @@ bool setChargingEnabled(bool enabled) {
         // Chemistry-safe OVP cap
         const BatteryParameters& bp = batteryManager.getParameters();
         float packOvCapV = (bp.cellVoltageMax / 1000.0f) * bp.cellCount;
-        float ovpCapPerPsuV = packOvCapV / static_cast<float>(SERIES_PSU_COUNT);
+        float ovpCapPerPsuV = packOvCapV / static_cast<float>(psuTopology.seriesCount());
         float ovpPerPsuV = targetPerPsuV + 1.0f; if (ovpPerPsuV > ovpCapPerPsuV) ovpPerPsuV = ovpCapPerPsuV;
         uint16_t vCv = static_cast<uint16_t>(targetPerPsuV * 100.0f);
         uint16_t i_dA = 0; // 0.0A per PSU to force output off
@@ -361,6 +388,13 @@ void onFlatpackDetected(uint64_t serial) {
     if (flatpackManager.sendLoginMessage(serial, loginMsg)) {
         Serial.printf("[FLATPACK] Login sent for %012llX\n", serial);
         
+        if (currentBatterySource == BATTERY_SOURCE_PYLONTECH_CAN) {
+            // Never apply the legacy unconditional initial charging setpoint.
+            flatpackManager.setOutputParameters(4370, 0, 4500, serial);
+            // First installation still requires programming/verifying 43.7V NVRAM
+            // with the battery DC cable disconnected.
+        }
+
         // Program a safer low fallback voltage to PSU NVRAM so that if comms are lost or on power cycle,
         // each rectifier falls back to a conservative per-PSU voltage that reduces surge at low pack voltage.
         // Use configured default per-PSU fallback voltage (clamped in setter), within 43.5..57.5V range.
@@ -380,11 +414,16 @@ void onFlatpackDetected(uint64_t serial) {
         
         // Use configured series PSU count, warn if detection disagrees
         uint8_t detectedCount = flatpackManager.getFlatpacks().size();
-        if (detectedCount != SERIES_PSU_COUNT) {
-            Serial.printf("[WARN] Detected %u PSUs, but build is configured for %u in series. Using configured value.\n",
-                          detectedCount, SERIES_PSU_COUNT);
+        if (detectedCount != psuTopology.count()) {
+            Serial.printf("[WARN] Detected %u PSUs, configured %u in %s.\n",
+                          detectedCount, psuTopology.count(), psuTopology.name());
         }
-        batteryManager.getChargingSetpoints(voltage, current, ovp, SERIES_PSU_COUNT);
+        if (currentBatterySource == BATTERY_SOURCE_PYLONTECH_CAN) {
+            voltage = 4370; current = 0; ovp = 4500;
+        } else {
+            batteryManager.getChargingSetpoints(voltage, current, ovp,
+                psuTopology.seriesCount(), psuTopology.parallelCount());
+        }
         
         if (flatpackManager.setOutputParameters(voltage, current, ovp, serial)) {
             Serial.printf("[FLATPACK] Set initial parameters for PSU %012llX\n", serial);
@@ -392,7 +431,8 @@ void onFlatpackDetected(uint64_t serial) {
         }
 
         // Auto-start charging if enabled in settings
-        if (batteryManager.getAutoStartCharging()) {
+        if (batteryManager.getAutoStartCharging() &&
+            currentBatterySource != BATTERY_SOURCE_PYLONTECH_CAN) {
             setChargingEnabled(true);
         }
     } else {
@@ -422,8 +462,8 @@ void onFlatpackStatus(const FlatpackData& flatpack) {
             // Convert from fixed-point to float
             // Series stack assumption: Pack voltage is sum (avg * count). Pack current is the same through each PSU,
             // so use the average (not sum) of PSU currents.
-            totalPackVoltage = (avgVoltage / 100.0f) * activePsuCount;       // cV -> V, then sum
-            totalPackCurrent = (activePsuCount > 0) ? (totalCurrent / 10.0f) / activePsuCount : 0.0f; // dA -> A, average
+            totalPackVoltage = (avgVoltage / 100.0f) * psuTopology.seriesCount();
+            totalPackCurrent = (totalCurrent / 10.0f) / psuTopology.seriesCount();
 
             // Note: Do not override control current with ADS1220; keep Flatpack-derived for control
             
@@ -504,6 +544,15 @@ void processTWAIMessages() {
         }
 #endif
 
+        // Solar BMS uses standard 11-bit frames; consume them before the
+        // legacy extended-ID filter for VX1/Gree.
+#if defined(BATTERY_PLATFORM_PYLONTECH)
+        if (!isExtended && !(message.flags & TWAI_MSG_FLAG_RTR)) {
+            pylonBms.ingest(message.identifier, false, false, message.data,
+                             message.data_length_code, millis());
+        }
+        continue;
+#endif
         // For normal processing below we only pass extended frames to managers
         if (!isExtended) {
             continue;
@@ -587,6 +636,49 @@ void updateChargingParameters() {
     // Get charging parameters from battery manager
     uint16_t voltage, current, ovp;
 
+    // Shared physical constraint: the chosen wiring must place every
+    // rectifier within the achievable 43.5..57.5V range. Incompatible
+    // configurations must never silently reuse the previous high setpoint.
+    const BatteryParameters& topologyBattery = batteryManager.getParameters();
+    const float nominalPackTargetV =
+        (topologyBattery.cellVoltageMax / 1000.0f) * topologyBattery.cellCount;
+    const float perPsuTargetV = nominalPackTargetV / psuTopology.seriesCount();
+    if (perPsuTargetV < FLATPACK_VOLT_MIN || perPsuTargetV > FLATPACK_VOLT_MAX) {
+        static uint32_t lastBadTopologyLog = 0;
+        if ((uint32_t)(millis() - lastBadTopologyLog) > 5000) {
+            lastBadTopologyLog = millis();
+            Serial.printf("[SAFE] Wiring %s x%u incompatible with %.2fV battery target; output OFF\n",
+                          psuTopology.name(), psuTopology.count(), nominalPackTargetV);
+        }
+        flatpackManager.setOutputParameters(4370, 0, 4500, 0);
+        return;
+    }
+
+    if (currentBatterySource == BATTERY_SOURCE_PYLONTECH_CAN) {
+        const bool valid = pylonBms.canCharge(millis());
+        // 16S LFP cannot be charged by two or more 43.5V-minimum rectifiers
+        // in series. A mismatched topology is a start-inhibit condition.
+        const bool compatible = psuTopology.seriesCount() == 1;
+        if (!valid || !compatible || gPylontechManualInhibit) {
+            if (batteryManager.getStatus().isCharging) batteryManager.stopCharging();
+            flatpackManager.setOutputParameters(4370, 0, 4500, 0);
+            return;
+        }
+        const auto& fpsNow = flatpackManager.getFlatpacks();
+        uint8_t readyCount = 0;
+        for (const auto& fp : fpsNow) {
+            if (fp.loggedIn && !fp.hasAlerts &&
+                (uint32_t)(millis() - fp.lastStatusTime) <= 3000)
+                ++readyCount;
+        }
+        if (readyCount != psuTopology.count()) {
+            if (batteryManager.getStatus().isCharging) batteryManager.stopCharging();
+            flatpackManager.setOutputParameters(4370, 0, 4500, 0);
+            return;
+        }
+        if (!batteryManager.getStatus().isCharging) batteryManager.startCharging();
+    }
+
     // SAFETY: in VX1 mode the charge target is derived from the BMS FEF3 stream.
     // If that stream goes stale (BMS node wedged, bus glitch, etc.) we must NOT
     // keep pushing the last full CC/CV setpoint. Command all PSUs to a safe
@@ -602,7 +694,7 @@ void updateChargingParameters() {
         // Chemistry-safe OVP cap from configured per-cell maximum.
         const BatteryParameters& bp = batteryManager.getParameters();
         float packOvCapV = (bp.cellVoltageMax / 1000.0f) * bp.cellCount;
-        float ovpCapPerPsuV = packOvCapV / static_cast<float>(SERIES_PSU_COUNT);
+        float ovpCapPerPsuV = packOvCapV / static_cast<float>(psuTopology.seriesCount());
         float ovpPerPsuV = FLATPACK_VOLT_MIN + 1.0f;
         if (ovpPerPsuV > ovpCapPerPsuV) ovpPerPsuV = ovpCapPerPsuV;
         uint16_t vCv = static_cast<uint16_t>(FLATPACK_VOLT_MIN * 100.0f);
@@ -618,9 +710,9 @@ void updateChargingParameters() {
     // Evaluate runtime stack health (count online vs expected)
     const auto& fps = flatpackManager.getFlatpacks();
     uint8_t online = 0; for (const auto& p : fps) { if (p.loggedIn) ++online; }
-    if (online != SERIES_PSU_COUNT) {
+    if (online != psuTopology.count()) {
         if (!gPsuMismatchActive) {
-            Serial.printf("[ERROR] PSU series count mismatch: online=%u, expected=%u. Entering mismatch lockout.\n", online, SERIES_PSU_COUNT);
+            Serial.printf("[ERROR] PSU series count mismatch: online=%u, expected=%u. Entering mismatch lockout.\n", online, psuTopology.count());
         }
         gPsuMismatchActive = true;
         // Apply conservative downshift continuously while mismatched
@@ -634,7 +726,7 @@ void updateChargingParameters() {
         if (targetPerPsuV > FLATPACK_VOLT_MAX) targetPerPsuV = FLATPACK_VOLT_MAX;
         const BatteryParameters& bp = batteryManager.getParameters();
         float packOvCapV = (bp.cellVoltageMax / 1000.0f) * bp.cellCount;
-        float ovpCapPerPsuV = packOvCapV / static_cast<float>(SERIES_PSU_COUNT);
+        float ovpCapPerPsuV = packOvCapV / static_cast<float>(psuTopology.seriesCount());
         float ovpPerPsuV = targetPerPsuV + 1.0f; if (ovpPerPsuV > ovpCapPerPsuV) ovpPerPsuV = ovpCapPerPsuV;
         uint16_t vCv = static_cast<uint16_t>(targetPerPsuV * 100.0f);
         uint16_t i_dA = 1; // 0.1A per PSU
@@ -653,10 +745,11 @@ void updateChargingParameters() {
 
     // Use configured series PSU count; warn if runtime detection also disagreed earlier
     uint8_t detectedCount = fps.size();
-    if (detectedCount != SERIES_PSU_COUNT) {
-        Serial.printf("[WARN] Detected %u PSUs in registry, but using configured %u.\n", detectedCount, SERIES_PSU_COUNT);
+    if (detectedCount != psuTopology.count()) {
+        Serial.printf("[WARN] Detected %u PSUs in registry, but using configured %u.\n", detectedCount, psuTopology.count());
     }
-    batteryManager.getChargingSetpoints(voltage, current, ovp, SERIES_PSU_COUNT);
+    batteryManager.getChargingSetpoints(voltage, current, ovp,
+        psuTopology.seriesCount(), psuTopology.parallelCount());
 
     // A current of 0 is a VALID command ("output off") that several safety
     // paths in getChargingSetpoints() deliberately return (deep-LV duty OFF
@@ -751,10 +844,28 @@ void setup() {
     }
     Serial.println("[INIT] Hardware manager initialized successfully");
     
-    // Initialize TWAI for selected platform (both VX1 and Gree use 250kbps)
+    // Topology defaults stay unchanged for legacy builds; Pylontech defaults
+    // to a single PSU in parallel mode. Saved UI settings take effect on boot.
+#if defined(BATTERY_PLATFORM_PYLONTECH)
+    psuTopology.load(PsuTopology::Mode::PARALLEL, 1, "psu-topo-biom");
+#elif defined(BATTERY_PLATFORM_GREE_TRACTOR)
+    psuTopology.load(PsuTopology::Mode::SERIES, SERIES_PSU_COUNT, "psu-topo-gree");
+#else
+    psuTopology.load(PsuTopology::Mode::SERIES, SERIES_PSU_COUNT, "psu-topo-vx1");
+#endif
+    Serial.printf("[PSU] Topology %s x%u\n", psuTopology.name(), psuTopology.count());
+
+    // Initialize TWAI for selected platform
     if (currentBatterySource == BATTERY_SOURCE_VECTRIX_VX1 ||
-        currentBatterySource == BATTERY_SOURCE_CREE_LTO) {
-        Serial.println("[INIT] Configuring TWAI (250kbps)");
+        currentBatterySource == BATTERY_SOURCE_CREE_LTO ||
+        currentBatterySource == BATTERY_SOURCE_PYLONTECH_CAN) {
+        Serial.println(currentBatterySource == BATTERY_SOURCE_PYLONTECH_CAN
+            ? "[INIT] Pylontech CAN 500kbps Listen-Only"
+            : "[INIT] Configuring TWAI (250kbps)");
+#if defined(BATTERY_PLATFORM_PYLONTECH)
+        twai_g_config.rx_queue_len = 64;
+        twai_g_config.tx_queue_len = 0;
+#endif
 
 #ifdef TWAI_GREE_TRAFFIC_DEBUG
         // In debug, force listen-only and larger queues to sniff without ACK
@@ -827,6 +938,13 @@ void setup() {
             Serial.printf("[INIT] Configuring for Vectrix VX1 BMS (%dS, %.2fV target)\n", 
                          userCellCount, userTargetCellVoltage);
             break;
+        case BATTERY_SOURCE_PYLONTECH_CAN:
+            chemistry = BatteryChemistry::LFP;
+            cellCount = 16;
+            capacity = 314.0f;
+            source = BatterySource::PYLONTECH_CAN;
+            Serial.println("[INIT] Pylontech 16S LFP, 314Ah, BMS-controlled");
+            break;
         case BATTERY_SOURCE_CREE_LTO:
             chemistry = BatteryChemistry::LTO;
             cellCount = 36;  // Gree LTO pack (36S)
@@ -856,6 +974,22 @@ void setup() {
     
     // Load saved settings after initialization so they override defaults
     batteryManager.loadSettings();
+
+    if (currentBatterySource == BATTERY_SOURCE_PYLONTECH_CAN) {
+        // Fixed NVRAM fallback for the generator charger profile.
+        batteryManager.setDefaultPerPsuVoltage(43.7f);
+        batteryManager.setOperatingMode(OperatingMode::BMS_CONTROLLED);
+        batteryManager.setDisableCurrentLimit(false);
+        BatteryParameters p = batteryManager.getParameters();
+        p.chemistry = BatteryChemistry::LFP;
+        p.cellCount = 16;
+        // Keep original float profile, cap CV at 56.32 V.
+        if (p.cellVoltageMax > 3520 || p.cellVoltageMax < 3200)
+            p.cellVoltageMax = 3520;
+        if (p.cellVoltageFloat > p.cellVoltageMax)
+            p.cellVoltageFloat = p.cellVoltageMax;
+        batteryManager.setParameters(p);
+    }
 
     // For Gree LTO platform, prefer BMS-controlled mode by default
     // NVS may have preserved MANUAL from previous runs; override here to follow Gree BMS
@@ -984,6 +1118,24 @@ void setup() {
         if (webServerManager.initialize(80)) {
             // Set up web server callbacks
             webServerManager.setFlatpackDataCallback(getFlatpackData);
+            webServerManager.setTopologyGetCallback([]() -> String {
+                DynamicJsonDocument json(192);
+                json["mode"] = psuTopology.name();
+                json["count"] = psuTopology.count();
+                json["seriesCount"] = psuTopology.seriesCount();
+                json["parallelCount"] = psuTopology.parallelCount();
+                String out;
+                serializeJson(json, out);
+                return out;
+            });
+            webServerManager.setTopologySetCallback([](bool parallel, uint8_t count) {
+                // Persist desired wiring; do not touch the live charging controller
+                // until the next boot. Matches physical rewiring requirement.
+                PsuTopology requested = psuTopology;
+                return requested.configure(
+                    parallel ? PsuTopology::Mode::PARALLEL : PsuTopology::Mode::SERIES,
+                    count);
+            });
             webServerManager.setBatteryStatusCallback(getBatteryStatus);
             webServerManager.setBatteryParametersCallback(getBatteryParameters);
             webServerManager.setChargingParametersCallback(setChargingParameters);
@@ -1075,7 +1227,11 @@ void setup() {
     }
     
     // Handle battery charging and voltage sweep based on configuration flags
-    if (ENABLE_BATTERY_CHARGING) {
+    if (currentBatterySource == BATTERY_SOURCE_PYLONTECH_CAN) {
+        chargingEnabled = true; // controller active; no charge until BMS permits
+        batteryManager.stopCharging();
+        Serial.println("[INIT] Pylontech waiting for 0x351/355/356/359/35C");
+    } else if (ENABLE_BATTERY_CHARGING) {
         chargingEnabled = true;
         batteryManager.startCharging();
         Serial.println("[INIT] Battery charging enabled");
@@ -1112,6 +1268,13 @@ void loop() {
     
     // Update managers
     flatpackManager.update();
+#if defined(BATTERY_PLATFORM_PYLONTECH)
+    if (pylonBms.valid(millis())) {
+        batteryManager.updateFromPylontech(pylonBms.data(), pylonBms.canCharge(millis()));
+    } else {
+        batteryManager.invalidatePylontech();
+    }
+#endif
     batteryManager.update();
     ads1220.update();
     metrics.update();

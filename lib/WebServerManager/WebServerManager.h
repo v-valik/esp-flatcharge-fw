@@ -78,6 +78,8 @@ public:
     using SetAcPresetCallback = std::function<bool(uint8_t presetId)>;
     using SetMaxCellVoltageCallback = std::function<bool(float cellV)>; // Volts per cell
     using SetAutoStartChargingCallback = std::function<bool(bool enable)>;
+    using GetTopologyCallback = std::function<String()>;
+    using SetTopologyCallback = std::function<bool(bool parallel, uint8_t count)>;
 
     // ADS1220 current sensor callbacks
     using ADSGetCallback = std::function<void(float& currentA, bool& valid, float& zeroV, float& apv, float& rawV)>;
@@ -235,6 +237,8 @@ public:
     void setAdsCalZeroCallback(ADSCalZeroCallback cb);
     void setAdsSetScaleCallback(ADSSetScaleCallback cb);
     void setGreeJsonCallback(CustomJsonCallback cb);
+    void setTopologyGetCallback(GetTopologyCallback cb) { topologyGetCallback = cb; }
+    void setTopologySetCallback(SetTopologyCallback cb) { topologySetCallback = cb; }
 
     // Metrics (InfluxDB) setters
     void setMetricsGetCallback(GetMetricsConfigCallback cb);
@@ -331,6 +335,8 @@ private:
 
     // Custom JSON providers
     CustomJsonCallback greeJsonCallback;
+    GetTopologyCallback topologyGetCallback;
+    SetTopologyCallback topologySetCallback;
     GetMetricsConfigCallback metricsGetCallback;
     SetMetricsConfigCallback metricsSetCallback;
     SetAutoStartChargingCallback autoStartChargingCallback;

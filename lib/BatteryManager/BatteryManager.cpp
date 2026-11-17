@@ -225,6 +225,7 @@ bool BatteryManager::initialize(BatteryChemistry chemistry, uint16_t cellCount, 
         case BatterySource::MANUAL: sourceName = "Manual"; break;
         case BatterySource::CREE_LTO: sourceName = "Cree LTO"; break;
         case BatterySource::VECTRIX_VX1: sourceName = "Vectrix VX1"; break;
+        case BatterySource::PYLONTECH_CAN: sourceName = "Pylontech CAN"; break;
     }
     
     Serial.printf("[BatteryManager] Initialized with %s chemistry, %d cells, %.1f Ah capacity, %s source\n",
@@ -261,7 +262,44 @@ const BatteryParameters& BatteryManager::getParameters() const {
     return params;
 }
 
+void BatteryManager::updateFromPylontech(const PylontechBms::Data& d, bool allowed) {
+    if (status.dataSource != BatterySource::PYLONTECH_CAN) return;
+    const unsigned long now = millis();
+    if (lastUpdateTime && status.isCharging) {
+        chargingTimeMsRemainder += now - lastUpdateTime;
+        if (chargingTimeMsRemainder >= 60000UL) {
+            status.chargingTimeMin += chargingTimeMsRemainder / 60000UL;
+            chargingTimeMsRemainder %= 60000UL;
+        }
+    }
+    lastUpdateTime = now;
+    status.packVoltage = d.packVoltageV;
+    status.packCurrent = d.packCurrentA;
+    status.cellVoltageAvg = params.cellCount ? d.packVoltageV / params.cellCount : 0.0f;
+    status.temperature = static_cast<int8_t>(lroundf(d.temperatureC));
+    status.temperatureMin = status.temperatureMax = status.temperature;
+    status.stateOfCharge = d.soc;
+    status.bmsChargeVoltageLimitV = d.chargeVoltageV;
+    status.bmsChargeCurrentLimitA = d.chargeLimitA;
+    status.bmsChargeAllowed = allowed;
+    status.bmsDataValid = true;
+    status.isError = (d.protection0 | d.protection1) != 0 ||
+                     status.chargingTimeMin > params.maxChargingTime;
+    status.errorFlags = status.isError ? 0x10 : 0;
+    updateChargingMode();
+}
+
+void BatteryManager::invalidatePylontech() {
+    if (status.dataSource == BatterySource::PYLONTECH_CAN) {
+        status.bmsDataValid = false;
+        status.bmsChargeAllowed = false;
+        status.bmsChargeCurrentLimitA = 0.0f;
+    }
+}
+
 void BatteryManager::updateStatus(float voltage, float current, int8_t temperature) {
+    // BMS is authoritative for Pylontech: do not replace SOC or pack current.
+    if (status.dataSource == BatterySource::PYLONTECH_CAN) return;
     unsigned long currentTime = millis();
     
     // Calculate time elapsed since last update.
@@ -330,6 +368,9 @@ bool BatteryManager::startCharging() {
         return false;
     }
     
+    if (status.dataSource == BatterySource::PYLONTECH_CAN &&
+        (!status.bmsDataValid || !status.bmsChargeAllowed)) return false;
+
     if (status.isError) {
         Serial.println("[BatteryManager] ERROR: Cannot start charging due to error condition");
         return false;
@@ -379,11 +420,17 @@ void BatteryManager::update() {
 }
 
 void BatteryManager::getChargingSetpoints(uint16_t& voltage, uint16_t& current, uint16_t& ovp) {
-    getChargingSetpoints(voltage, current, ovp, 1); // Default to 1 PSU for backward compatibility
+    getChargingSetpoints(voltage, current, ovp, 1, 1); // Default to 1 PSU for backward compatibility
 }
 
 void BatteryManager::getChargingSetpoints(uint16_t& voltage, uint16_t& current, uint16_t& ovp, uint8_t psuCount) {
-    if (!initialized || !status.isCharging) {
+    getChargingSetpoints(voltage, current, ovp, psuCount, 1);
+}
+
+void BatteryManager::getChargingSetpoints(uint16_t& voltage, uint16_t& current, uint16_t& ovp, uint8_t psuCount, uint8_t parallelCount) {
+    if (!psuCount || !parallelCount || !initialized || !status.isCharging ||
+        (status.dataSource == BatterySource::PYLONTECH_CAN &&
+         (!status.bmsDataValid || !status.bmsChargeAllowed))) {
         voltage = 0;
         current = 0;
         ovp = 0;
@@ -399,9 +446,20 @@ void BatteryManager::getChargingSetpoints(uint16_t& voltage, uint16_t& current, 
     if (totalPackVoltage > MAX_PACK_VOLTAGE_V) {
         totalPackVoltage = MAX_PACK_VOLTAGE_V;
     }
+    if (status.dataSource == BatterySource::PYLONTECH_CAN) {
+        const float bmsTarget = status.bmsChargeVoltageLimitV - 0.10f;
+        if (totalPackVoltage > bmsTarget) totalPackVoltage = bmsTarget;
+        if (totalPackVoltage < FLATPACK_VOLT_MIN * psuCount + 0.2f) {
+            voltage = static_cast<uint16_t>(FLATPACK_VOLT_MIN * 100);
+            current = 0;
+            ovp = static_cast<uint16_t>((FLATPACK_VOLT_MIN + 1.0f) * 100);
+            return;
+        }
+    }
     
     // Divide voltage by number of PSUs in series and add compensation
-    float targetVoltagePerPsu = (totalPackVoltage + status.voltageDropCompensation) / psuCount;
+    float targetVoltagePerPsu = (totalPackVoltage +
+        (status.dataSource == BatterySource::PYLONTECH_CAN ? 0.0f : status.voltageDropCompensation)) / psuCount;
     
     // Convert to centivolts (0.01V units)
     voltage = static_cast<uint16_t>(targetVoltagePerPsu * 100.0f);
@@ -427,12 +485,14 @@ void BatteryManager::getChargingSetpoints(uint16_t& voltage, uint16_t& current, 
     
     // If current limiting is disabled, bypass ramping and LV safe-start. Command target voltage
     // and allow per-PSU current up to device limit. OVP: clamp to chemistry cap (<= 4.16V/cell).
-    if (status.disableCurrentLimit) {
+    if (status.disableCurrentLimit && status.dataSource != BatterySource::PYLONTECH_CAN) {
         const float PER_PSU_CURRENT_LIMIT_A = 41.7f; // 2kW FP max at ~48V
         current = static_cast<uint16_t>(PER_PSU_CURRENT_LIMIT_A * 10.0f); // deciamps
         // Per-PSU OVP cap from per-cell max
         const float packOvCapV = (params.cellVoltageMax / 1000.0f) * static_cast<float>(params.cellCount);
-        const float ovpCapPerPsuV = packOvCapV / static_cast<float>(psuCount);
+        const float ovpCapPerPsuV = (status.dataSource == BatterySource::PYLONTECH_CAN
+            ? fminf(packOvCapV, status.bmsChargeVoltageLimitV)
+            : packOvCapV) / static_cast<float>(psuCount);
         // Try to keep ~1.0V headroom over commanded voltage but never exceed cap
         float ovpVoltagePerPsu = targetVoltagePerPsu + 1.0f;
         if (ovpVoltagePerPsu > ovpCapPerPsuV) ovpVoltagePerPsu = ovpCapPerPsuV;
@@ -443,22 +503,35 @@ void BatteryManager::getChargingSetpoints(uint16_t& voltage, uint16_t& current, 
     // Calculate target charging current (A)
     float desiredCurrentA;
     if (status.operatingMode == OperatingMode::MANUAL_CONTROLLED) {
-        desiredCurrentA = status.manualCurrentLimit;
+        desiredCurrentA = status.manualCurrentLimit * parallelCount;
     } else {
         desiredCurrentA = calculateChargingCurrent();
         // For Cree/Gree LTO, follow BMS fully (do not clamp by manualCurrentLimit)
         if (status.dataSource != BatterySource::CREE_LTO) {
             // Safety cap: never exceed manual limit for non-Gree sources
-            if (desiredCurrentA > status.manualCurrentLimit) {
-                desiredCurrentA = status.manualCurrentLimit;
+            if (desiredCurrentA > status.manualCurrentLimit * parallelCount) {
+                desiredCurrentA = status.manualCurrentLimit * parallelCount;
             }
         }
     }
 
     // Enforce per-PSU current limit for 2kW Flatpacks
     const float PER_PSU_CURRENT_LIMIT_A = 41.7f; // 2kW FP max at ~48V
-    if (desiredCurrentA > PER_PSU_CURRENT_LIMIT_A) {
-        desiredCurrentA = PER_PSU_CURRENT_LIMIT_A;
+    if (desiredCurrentA > PER_PSU_CURRENT_LIMIT_A * parallelCount) {
+        desiredCurrentA = PER_PSU_CURRENT_LIMIT_A * parallelCount;
+    }
+    if (status.dataSource == BatterySource::PYLONTECH_CAN &&
+        desiredCurrentA > status.bmsChargeCurrentLimitA) {
+        desiredCurrentA = status.bmsChargeCurrentLimitA;
+    }
+    if (status.dataSource == BatterySource::PYLONTECH_CAN) {
+        // Conservative power cap for Flatpack2 HE 2000W at elevated 16S
+        // charging voltage. The 41.7A hardware cap above remains active.
+#ifndef BIOM_PSU_WATTS
+#define BIOM_PSU_WATTS 2000.0f
+#endif
+        const float maxByPowerA = (BIOM_PSU_WATTS / targetVoltagePerPsu) * parallelCount;
+        if (desiredCurrentA > maxByPowerA) desiredCurrentA = maxByPowerA;
     }
 
     // Update ramp target
@@ -467,7 +540,8 @@ void BatteryManager::getChargingSetpoints(uint16_t& voltage, uint16_t& current, 
     // Deep-LV behavior: For single-phase AC presets, duty-cycle the output below 43.5V/PSU
     // to limit average AC power while still raising pack voltage. For other presets, enforce
     // a hard lockout (0A) until >= 43.5V/PSU.
-    if (status.dataSource != BatterySource::CREE_LTO) {
+    if (status.dataSource != BatterySource::CREE_LTO &&
+        status.dataSource != BatterySource::PYLONTECH_CAN) {
         float measuredPerPsuV_pre = 0.0f;
         if (psuCount > 0) measuredPerPsuV_pre = status.packVoltage / static_cast<float>(psuCount);
         const bool isSinglePhase = (acPreset == AcPreset::SINGLE_PHASE_7A) || (acPreset == AcPreset::SINGLE_PHASE_15A);
@@ -556,7 +630,8 @@ void BatteryManager::getChargingSetpoints(uint16_t& voltage, uint16_t& current, 
     // Low-voltage current control for ALL modes: below ~47V/PSU the FPs don't regulate CC well.
     // Adjust the per-PSU voltage around the measured value to track the desired current.
     // Once above the LV threshold, command the chemistry target directly.
-    if (status.dataSource != BatterySource::CREE_LTO) {
+    if (status.dataSource != BatterySource::CREE_LTO &&
+        status.dataSource != BatterySource::PYLONTECH_CAN) {
         const float LV_CC_THRESHOLD_V = 49.0f;
         float measuredPerPsuV = 0.0f;
         if (psuCount > 0) measuredPerPsuV = status.packVoltage / static_cast<float>(psuCount);
@@ -695,7 +770,7 @@ void BatteryManager::getChargingSetpoints(uint16_t& voltage, uint16_t& current, 
     rampLastUpdate = now;
 
     // Convert to deciamps (0.1A units)
-    current = static_cast<uint16_t>(rampCurrentA * 10.0f);
+    current = static_cast<uint16_t>((rampCurrentA / parallelCount) * 10.0f);
     // Ensure we send at least 0.1A when ramping up to a non-zero target
     if (current == 0 && rampTargetA > 0.0f) {
         current = 1; // 0.1A
@@ -910,6 +985,7 @@ void BatteryManager::printStatus() const {
         case BatterySource::MANUAL: sourceName = "Manual"; break;
         case BatterySource::CREE_LTO: sourceName = "Cree LTO"; break;
         case BatterySource::VECTRIX_VX1: sourceName = "Vectrix VX1"; break;
+        case BatterySource::PYLONTECH_CAN: sourceName = "Pylontech CAN"; break;
     }
     
     Serial.printf("Chemistry: %s\n", chemName);
@@ -967,7 +1043,11 @@ void BatteryManager::updateChargingMode() {
     // Get charging current as C-rate (proportion of capacity)
     float cRate = 0.0f;
     if (capacityAh > 0) {
-        cRate = (status.packCurrent / capacityAh) * 100.0f; // in percent of capacity
+        // Pylontech current polarity depends on BMS profile; CV taper
+        // detection must use magnitude, not interpret negative current as 0.
+        const float measuredA = status.dataSource == BatterySource::PYLONTECH_CAN
+            ? fabsf(status.packCurrent) : status.packCurrent;
+        cRate = (measuredA / capacityAh) * 100.0f; // percent of capacity
     }
     
     ChargingMode previousMode = status.mode;

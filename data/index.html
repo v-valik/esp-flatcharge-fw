@@ -508,6 +508,25 @@
                         </div>
 
                         <div class="control-group">
+                            <label>Flatpack Wiring Topology</label>
+                            <div class="control-row">
+                                <select id="psuTopologyMode" onchange="beginEdit('topology')">
+                                    <option value="series">Series (higher voltage)</option>
+                                    <option value="parallel">Parallel (higher current)</option>
+                                </select>
+                                <select id="psuTopologyCount" onchange="beginEdit('topology')">
+                                    <option value="1">1 PSU</option>
+                                    <option value="2">2 PSUs</option>
+                                    <option value="3">3 PSUs</option>
+                                </select>
+                                <button onclick="savePsuTopology()">Save</button>
+                            </div>
+                            <div style="font-size:0.85rem;color:#666;margin-top:5px">
+                                Software MUST match physical wiring. Save requires an ESP reboot;
+                                do not rewire with AC/DC power connected. A 16S LFP pack requires 1 PSU in series.
+                            </div>
+                        </div>
+                        <div class="control-group">
                             <label>Max Cell Voltage (V)</label>
                             <div class="control-row">
                                 <input type="range" id="maxVoltageRange" min="3.8" max="4.16" step="0.01" value="4.05">
@@ -655,8 +674,9 @@
 
     <script>
         let updateInterval;
+        let lastTopology = null;
         let isConnected = false;
-        let userEditing = { current: false, maxVoltage: false, calOffset: false, defaultPsu: false, mode: false, disableCL: false, acPreset: false };
+        let userEditing = { current: false, maxVoltage: false, calOffset: false, defaultPsu: false, mode: false, disableCL: false, acPreset: false, topology: false };
         let refreshHoldUntil = 0;
         function holdRefresh(ms = 1200) { refreshHoldUntil = Date.now() + ms; }
         function extendHold(ms = 5000) { const t = Date.now() + ms; if (t > refreshHoldUntil) refreshHoldUntil = t; }
@@ -998,8 +1018,18 @@
                 </div>
             `;
 
+            // Pylontech LV reports pack metrics, not per-cell min/max in this frame set.
+            if (battery.dataSource === "pylontech") {
+                const valid = !!battery.bmsDataValid;
+                const allowed = valid && !!battery.bmsChargeAllowed;
+                html += `<div class="info-card"><div class="info-value">${valid ? "ONLINE" : "STALE"}</div><div class="info-label">Pylontech BMS</div></div>`;
+                html += `<div class="info-card"><div class="info-value">${allowed ? "YES" : "NO"}</div><div class="info-label">BMS Charge Permission</div></div>`;
+                html += `<div class="info-card"><div class="info-value">${valid ? battery.bmsChargeVoltageLimitV.toFixed(2)+"V" : "--"}</div><div class="info-label">BMS CVL</div></div>`;
+                html += `<div class="info-card"><div class="info-value">${valid ? battery.bmsChargeCurrentLimitA.toFixed(1)+"A" : "--"}</div><div class="info-label">BMS CCL</div></div>`;
+            }
+
             // If VX1 data is present (or fields provided), append high/low cells, delta, and min/max temps
-            const hasVX1 = (battery.dataSource === 'vx1') || (typeof battery.cellVoltageMax === 'number' && typeof battery.cellVoltageMin === 'number');
+            const hasVX1 = battery.dataSource === 'vx1' || battery.dataSource === 'cree_lto';
             if (hasVX1) {
                 const vMax = (typeof battery.cellVoltageMax === 'number' && !isNaN(battery.cellVoltageMax)) ? `${battery.cellVoltageMax.toFixed(3)}V` : 'N/A';
                 const vMin = (typeof battery.cellVoltageMin === 'number' && !isNaN(battery.cellVoltageMin)) ? `${battery.cellVoltageMin.toFixed(3)}V` : 'N/A';
@@ -1084,10 +1114,11 @@
             if (autoRefreshPaused || Date.now() < refreshHoldUntil) return;
             updateConnectionStatus(true);
             
-            const [flatpacksResp, battery, system] = await Promise.all([
+            const [flatpacksResp, battery, system, topology] = await Promise.all([
                 fetchData('flatpacks'),
                 fetchData('battery'),
-                fetchData('system')
+                fetchData('system'),
+                fetchData('topology')
             ]);
 
             const fps = (flatpacksResp && Array.isArray(flatpacksResp.flatpacks)) ? flatpacksResp.flatpacks : [];
@@ -1095,6 +1126,11 @@
             updatePSUDisplay(fps);
             if (battery) { lastBattery = battery; updateBatteryDisplay(battery); }
             if (system) updateSystemInfo(system);
+            if (topology) lastTopology = topology;
+            if (topology && !userEditing.topology) {
+                document.getElementById("psuTopologyMode").value = topology.mode;
+                document.getElementById("psuTopologyCount").value = String(topology.count);
+            }
             updateSummary(fps, battery);
         }
 
@@ -1127,7 +1163,7 @@
 
             const fps = lastFps || [];
             const online = fps.filter(p => p && p.loggedIn);
-            const psuCount = online.length || 3;
+            const psuCount = (lastTopology && lastTopology.count) ? lastTopology.count : 3;
 
             // Average measured VAC and per‑PSU DC voltage
             const vacAvg = (online.length > 0)
@@ -1136,7 +1172,7 @@
 
             let vpsu = 48.0;
             if (lastBattery && typeof lastBattery.packVoltage === 'number' && psuCount > 0) {
-                vpsu = clamp(lastBattery.packVoltage / psuCount, 43.5, 57.5);
+                vpsu = clamp(lastBattery.packVoltage / (lastTopology ? lastTopology.seriesCount : psuCount), 43.5, 57.5);
             } else if (online.length > 0) {
                 vpsu = clamp(online.reduce((acc, p) => acc + ((p.outputVoltage || 0) / 100.0), 0) / online.length, 43.5, 57.5);
             }
@@ -1337,6 +1373,19 @@
                 const rate = (typeof system.twaiRxRate === 'number') ? system.twaiRxRate.toFixed(0) : system.twaiRxRate;
                 topTwai.textContent = `TWAI ${rate}/s`;
             }
+        }
+
+        async function savePsuTopology() {
+            const mode = document.getElementById('psuTopologyMode').value;
+            const count = Number(document.getElementById('psuTopologyCount').value);
+            beginEdit('topology');
+            const result = await postData('topology', {mode, count});
+            if (result && result.success) {
+                showAlert('Topology saved. Restart ESP to activate. Check physical wiring first.', 'warning');
+            } else {
+                showAlert('Could not save PSU topology', 'danger');
+            }
+            endEdit('topology', 10000);
         }
 
         async function updateOperatingMode() {
