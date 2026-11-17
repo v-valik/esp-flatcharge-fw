@@ -524,6 +524,15 @@ void BatteryManager::getChargingSetpoints(uint16_t& voltage, uint16_t& current, 
         desiredCurrentA > status.bmsChargeCurrentLimitA) {
         desiredCurrentA = status.bmsChargeCurrentLimitA;
     }
+    if (status.dataSource == BatterySource::PYLONTECH_CAN) {
+        // Conservative power cap for Flatpack2 HE 2000W at elevated 16S
+        // charging voltage. The 41.7A hardware cap above remains active.
+#ifndef BIOM_PSU_WATTS
+#define BIOM_PSU_WATTS 2000.0f
+#endif
+        const float maxByPowerA = (BIOM_PSU_WATTS / targetVoltagePerPsu) * parallelCount;
+        if (desiredCurrentA > maxByPowerA) desiredCurrentA = maxByPowerA;
+    }
 
     // Update ramp target
     rampTargetA = desiredCurrentA;
