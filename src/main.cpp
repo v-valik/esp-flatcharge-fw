@@ -402,9 +402,9 @@ void onFlatpackDetected(uint64_t serial) {
         
         // Use configured series PSU count, warn if detection disagrees
         uint8_t detectedCount = flatpackManager.getFlatpacks().size();
-        if (detectedCount != SERIES_PSU_COUNT) {
-            Serial.printf("[WARN] Detected %u PSUs, but build is configured for %u in series. Using configured value.\n",
-                          detectedCount, SERIES_PSU_COUNT);
+        if (detectedCount != psuTopology.count()) {
+            Serial.printf("[WARN] Detected %u PSUs, configured %u in %s.\n",
+                          detectedCount, psuTopology.count(), psuTopology.name());
         }
         if (currentBatterySource == BATTERY_SOURCE_PYLONTECH_CAN) {
             voltage = 4370; current = 0; ovp = 4500;
@@ -696,7 +696,7 @@ void updateChargingParameters() {
         if (targetPerPsuV > FLATPACK_VOLT_MAX) targetPerPsuV = FLATPACK_VOLT_MAX;
         const BatteryParameters& bp = batteryManager.getParameters();
         float packOvCapV = (bp.cellVoltageMax / 1000.0f) * bp.cellCount;
-        float ovpCapPerPsuV = packOvCapV / static_cast<float>(SERIES_PSU_COUNT);
+        float ovpCapPerPsuV = packOvCapV / static_cast<float>(psuTopology.seriesCount());
         float ovpPerPsuV = targetPerPsuV + 1.0f; if (ovpPerPsuV > ovpCapPerPsuV) ovpPerPsuV = ovpCapPerPsuV;
         uint16_t vCv = static_cast<uint16_t>(targetPerPsuV * 100.0f);
         uint16_t i_dA = 1; // 0.1A per PSU
@@ -1084,6 +1084,26 @@ void setup() {
         if (webServerManager.initialize(80)) {
             // Set up web server callbacks
             webServerManager.setFlatpackDataCallback(getFlatpackData);
+            webServerManager.setTopologyGetCallback([]() -> String {
+                String out = "{\\"mode\\":\\"";
+                out += psuTopology.name();
+                out += "\\",\\"count\\":";
+                out += String(psuTopology.count());
+                out += ",\\"seriesCount\\":";
+                out += String(psuTopology.seriesCount());
+                out += ",\\"parallelCount\\":";
+                out += String(psuTopology.parallelCount());
+                out += "}";
+                return out;
+            });
+            webServerManager.setTopologySetCallback([](bool parallel, uint8_t count) {
+                // Persist desired wiring; do not touch the live charging controller
+                // until the next boot. Matches physical rewiring requirement.
+                PsuTopology requested = psuTopology;
+                return requested.configure(
+                    parallel ? PsuTopology::Mode::PARALLEL : PsuTopology::Mode::SERIES,
+                    count);
+            });
             webServerManager.setBatteryStatusCallback(getBatteryStatus);
             webServerManager.setBatteryParametersCallback(getBatteryParameters);
             webServerManager.setChargingParametersCallback(setChargingParameters);
