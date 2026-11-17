@@ -8,13 +8,15 @@
 //  - BATTERY_PLATFORM_VX1
 //  - BATTERY_PLATFORM_GREE_TRACTOR
 // If neither is defined, default to VX1.
-#if !defined(BATTERY_PLATFORM_VX1) && !defined(BATTERY_PLATFORM_GREE_TRACTOR)
+#if !defined(BATTERY_PLATFORM_VX1) && !defined(BATTERY_PLATFORM_GREE_TRACTOR) && !defined(BATTERY_PLATFORM_PYLONTECH)
 #define BATTERY_PLATFORM_VX1 1
 #endif
 
 // SERIES_PSU_COUNT default per platform (can be overridden by build flags)
 #ifndef SERIES_PSU_COUNT
-#  if defined(BATTERY_PLATFORM_GREE_TRACTOR)
+#  if defined(BATTERY_PLATFORM_PYLONTECH)
+#    define SERIES_PSU_COUNT 1
+#  elif defined(BATTERY_PLATFORM_GREE_TRACTOR)
 #    define SERIES_PSU_COUNT 2
 #  else
 #    define SERIES_PSU_COUNT 3
