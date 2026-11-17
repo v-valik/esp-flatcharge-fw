@@ -520,6 +520,45 @@ void WebServerManager::setupAPIRoutes() {
         handleGetStatus(request);
     });
     
+    // Connection topology: changes are persisted but take effect on next reboot.
+    server->on("/api/topology", HTTP_GET, [this](AsyncWebServerRequest* request) {
+        if (topologyGetCallback) {
+            request->send(200, "application/json", topologyGetCallback());
+        } else {
+            request->send(503, "application/json", "{\\"error\\":\\"Unavailable\\"}");
+        }
+    });
+    server->on("/api/topology", HTTP_POST,
+        [](AsyncWebServerRequest*) {}, nullptr,
+        [this](AsyncWebServerRequest* req, uint8_t* data, size_t len,
+               size_t index, size_t total) {
+            if (index == 0) {
+                req->_tempObject = new String();
+                static_cast<String*>(req->_tempObject)->reserve(total);
+            }
+            String* body = static_cast<String*>(req->_tempObject);
+            body->concat(reinterpret_cast<const char*>(data), len);
+            if (index + len != total) return;
+            DynamicJsonDocument doc(256);
+            auto err = deserializeJson(doc, *body);
+            delete body;
+            req->_tempObject = nullptr;
+            if (err || !doc["mode"].is<const char*>() || !doc["count"].is<int>()) {
+                req->send(400, "application/json", "{\\"error\\":\\"Invalid topology payload\\"}");
+                return;
+            }
+            const String mode = doc["mode"].as<String>();
+            const int count = doc["count"].as<int>();
+            if ((mode != "series" && mode != "parallel") || count < 1 || count > 3 ||
+                !topologySetCallback ||
+                !topologySetCallback(mode == "parallel", static_cast<uint8_t>(count))) {
+                req->send(400, "application/json", "{\\"error\\":\\"Topology rejected\\"}");
+                return;
+            }
+            req->send(200, "application/json",
+                "{\\"success\\":true,\\"message\\":\\"Saved; restart required\\"}");
+        });
+    
     // Flatpack data endpoint
     server->on("/api/flatpacks", HTTP_GET, [this](AsyncWebServerRequest* request) {
         handleGetFlatpacks(request);
