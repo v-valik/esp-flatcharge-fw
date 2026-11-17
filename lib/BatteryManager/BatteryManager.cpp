@@ -226,7 +226,6 @@ bool BatteryManager::initialize(BatteryChemistry chemistry, uint16_t cellCount, 
         case BatterySource::CREE_LTO: sourceName = "Cree LTO"; break;
         case BatterySource::VECTRIX_VX1: sourceName = "Vectrix VX1"; break;
         case BatterySource::PYLONTECH_CAN: sourceName = "Pylontech CAN"; break;
-        case BatterySource::PYLONTECH_CAN: sourceName = "Pylontech CAN"; break;
     }
     
     Serial.printf("[BatteryManager] Initialized with %s chemistry, %d cells, %.1f Ah capacity, %s source\n",
@@ -977,6 +976,7 @@ void BatteryManager::printStatus() const {
         case BatterySource::MANUAL: sourceName = "Manual"; break;
         case BatterySource::CREE_LTO: sourceName = "Cree LTO"; break;
         case BatterySource::VECTRIX_VX1: sourceName = "Vectrix VX1"; break;
+        case BatterySource::PYLONTECH_CAN: sourceName = "Pylontech CAN"; break;
     }
     
     Serial.printf("Chemistry: %s\n", chemName);
