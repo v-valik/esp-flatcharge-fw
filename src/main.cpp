@@ -153,7 +153,7 @@ bool setAcPresetCb(uint8_t presetId) {
     std::vector<FlatpackData> online;
     online.reserve(fps.size());
     for (const auto& p : fps) if (p.loggedIn) online.push_back(p);
-    const uint8_t psuCount = online.empty() ? SERIES_PSU_COUNT : static_cast<uint8_t>(online.size());
+    const uint8_t psuCount = online.empty() ? psuTopology.count() : static_cast<uint8_t>(online.size());
 
     // Average VAC across online PSUs
     float vacAvg = 230.0f;
@@ -166,7 +166,7 @@ bool setAcPresetCb(uint8_t presetId) {
     float vpsu = 48.0f;
     const BatteryStatus& bs = batteryManager.getStatus();
     if (bs.packVoltage > 1.0f && psuCount > 0) {
-        vpsu = bs.packVoltage / static_cast<float>(psuCount);
+        vpsu = bs.packVoltage / static_cast<float>(psuTopology.seriesCount());
     } else if (!online.empty()) {
         float sumV = 0.0f; for (const auto& p : online) sumV += (p.outputVoltage / 100.0f); // cV -> V
         vpsu = sumV / online.size();
@@ -1085,15 +1085,13 @@ void setup() {
             // Set up web server callbacks
             webServerManager.setFlatpackDataCallback(getFlatpackData);
             webServerManager.setTopologyGetCallback([]() -> String {
-                String out = "{\\"mode\\":\\"";
-                out += psuTopology.name();
-                out += "\\",\\"count\\":";
-                out += String(psuTopology.count());
-                out += ",\\"seriesCount\\":";
-                out += String(psuTopology.seriesCount());
-                out += ",\\"parallelCount\\":";
-                out += String(psuTopology.parallelCount());
-                out += "}";
+                DynamicJsonDocument json(192);
+                json["mode"] = psuTopology.name();
+                json["count"] = psuTopology.count();
+                json["seriesCount"] = psuTopology.seriesCount();
+                json["parallelCount"] = psuTopology.parallelCount();
+                String out;
+                serializeJson(json, out);
                 return out;
             });
             webServerManager.setTopologySetCallback([](bool parallel, uint8_t count) {
