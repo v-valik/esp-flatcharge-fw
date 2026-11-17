@@ -313,6 +313,7 @@ bool setDisableCurrentLimitCb(bool disabled) {
 
 // Set default per-PSU voltage used as NVRAM fallback inside each rectifier
 bool setDefaultPerPsuVoltageCb(float volts) {
+    if (currentBatterySource == BATTERY_SOURCE_PYLONTECH_CAN && fabsf(volts - 43.7f) > 0.01f) return false;
     Serial.printf("[Main] Setting default per-PSU fallback voltage to %.2fV\n", volts);
     bool result = batteryManager.setDefaultPerPsuVoltage(volts);
     if (result) {
@@ -953,6 +954,8 @@ void setup() {
     batteryManager.loadSettings();
 
     if (currentBatterySource == BATTERY_SOURCE_PYLONTECH_CAN) {
+        // Fixed NVRAM fallback for the generator charger profile.
+        batteryManager.setDefaultPerPsuVoltage(43.7f);
         batteryManager.setOperatingMode(OperatingMode::BMS_CONTROLLED);
         batteryManager.setDisableCurrentLimit(false);
         BatteryParameters p = batteryManager.getParameters();
