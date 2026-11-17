@@ -827,9 +827,11 @@ void setup() {
     // Topology defaults stay unchanged for legacy builds; Pylontech defaults
     // to a single PSU in parallel mode. Saved UI settings take effect on boot.
 #if defined(BATTERY_PLATFORM_PYLONTECH)
-    psuTopology.load(PsuTopology::Mode::PARALLEL, 1);
+    psuTopology.load(PsuTopology::Mode::PARALLEL, 1, "psu-topo-biom");
+#elif defined(BATTERY_PLATFORM_GREE_TRACTOR)
+    psuTopology.load(PsuTopology::Mode::SERIES, SERIES_PSU_COUNT, "psu-topo-gree");
 #else
-    psuTopology.load(PsuTopology::Mode::SERIES, SERIES_PSU_COUNT);
+    psuTopology.load(PsuTopology::Mode::SERIES, SERIES_PSU_COUNT, "psu-topo-vx1");
 #endif
     Serial.printf("[PSU] Topology %s x%u\n", psuTopology.name(), psuTopology.count());
 
