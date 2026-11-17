@@ -4,7 +4,7 @@
 #include <vector>
 #include <functional>
 #include <Preferences.h>
-#include "PylontechBms.h"
+#include "../../include/PylontechBms.h" // local library build sees the shared parser
 
 // Forward declarations
 struct VX1BmsData;
